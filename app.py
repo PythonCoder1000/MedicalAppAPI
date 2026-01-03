@@ -48,3 +48,7 @@ def label(req: LabelRequest):
     labels = ask_model(req.text)
     print("ENDPOINT_RETURN:", labels)
     return LabelResponse(labels=labels, pid=os.getpid())
+
+@app.get("/health")
+def health():
+    return {"ok": True}
