@@ -19,6 +19,16 @@ JOINT_ID_BY_NAME: Dict[JointName, JointId] = {
     "center": "joint7",
 }
 
+FEATURE_TO_JOINTS: Dict[str, List[JointId]] = {
+    "canal_stenosis": ["joint7"],
+    "disc_bulge": ["joint7"],
+    "foraminal_narrowing": ["joint2", "joint6", "joint5", "joint4"],
+    "foraminal_narrowing_left": ["joint5", "joint4"],
+    "foraminal_narrowing_right": ["joint2", "joint6"],
+    "foraminal_narrowing_bilateral": ["joint2", "joint6", "joint5", "joint4"],
+    "foraminal_narrowing_unknown": ["joint2", "joint6", "joint5", "joint4"],
+}
+
 _SPINE_EXTRACT_INSTRUCTIONS = (
     "Return ONLY JSON matching the schema.\n"
     "Extract ONLY abnormal spine levels explicitly described.\n"
@@ -180,8 +190,76 @@ def compute_joint_moves(abns: List[Abnormality]) -> Dict[JointName, float]:
 def _semantic_to_joint_ids(semantic: Dict[JointName, float]) -> Dict[JointId, float]:
     out: Dict[JointId, float] = {}
     for k, v in semantic.items():
-        jid = JOINT_ID_BY_NAME[k]
-        out[jid] = float(v)
+        out[JOINT_ID_BY_NAME[k]] = float(v)
+    return out
+
+
+def _compute_fancy_feature_weights(abns: List[Abnormality]) -> Dict[str, float]:
+    disc_bulge_mm: Optional[float] = None
+    canal_weight: Optional[float] = None
+    foram_left: Optional[float] = None
+    foram_right: Optional[float] = None
+    foram_any: Optional[float] = None
+
+    for a in abns:
+        if a.type in ("annular_bulge", "disc_bulge"):
+            if isinstance(a.size_mm, (int, float)):
+                x = float(a.size_mm)
+                if disc_bulge_mm is None or x > disc_bulge_mm:
+                    disc_bulge_mm = x
+
+        if a.type == "stenosis":
+            w = _sev_to_weight(a.severity)
+            canal_weight = w if canal_weight is None else max(canal_weight, w)
+
+        if a.type == "foraminal_narrowing":
+            w = _sev_to_weight(a.severity)
+            lat = a.laterality or "unknown"
+            if lat == "left":
+                foram_left = w if foram_left is None else max(foram_left, w)
+            elif lat == "right":
+                foram_right = w if foram_right is None else max(foram_right, w)
+            elif lat == "bilateral":
+                foram_any = w if foram_any is None else max(foram_any, w)
+            else:
+                foram_any = w if foram_any is None else max(foram_any, w)
+
+    out: Dict[str, float] = {}
+
+    if disc_bulge_mm is not None:
+        out["disc_bulge"] = _clamp01(disc_bulge_mm / 5.0)
+
+    if canal_weight is not None:
+        out["canal_stenosis"] = _clamp01(canal_weight)
+
+    if foram_left is not None:
+        out["foraminal_narrowing_left"] = _clamp01(foram_left)
+
+    if foram_right is not None:
+        out["foraminal_narrowing_right"] = _clamp01(foram_right)
+
+    if foram_any is not None:
+        out["foraminal_narrowing"] = _clamp01(foram_any)
+
+    return out
+
+
+def _fancy_weights_to_joint_ids(weights: Dict[str, float]) -> Dict[JointId, float]:
+    out: Dict[JointId, float] = {}
+    for feature, w in weights.items():
+        jids = FEATURE_TO_JOINTS.get(feature)
+        if not jids:
+            continue
+        val = _clamp01(float(w))
+        for jid in jids:
+            out[jid] = _clamp01(max(float(out.get(jid, 0.0)), val))
+    return out
+
+
+def _merge_joint_id_maps(a: Dict[JointId, float], b: Dict[JointId, float]) -> Dict[JointId, float]:
+    out: Dict[JointId, float] = dict(a)
+    for k, v in b.items():
+        out[k] = _clamp01(max(float(out.get(k, 0.0)), float(v)))
     return out
 
 
@@ -242,10 +320,16 @@ def to_api_payload(extracted: ExtractedJson, allowed_levels: Optional[List[str]]
             continue
 
         semantic = compute_joint_moves(lvl.abnormalities)
-        if max(semantic.values()) <= 0.0:
+        semantic_joints = _semantic_to_joint_ids(semantic)
+
+        fancy_weights = _compute_fancy_feature_weights(lvl.abnormalities)
+        fancy_joints = _fancy_weights_to_joint_ids(fancy_weights)
+
+        joints = _merge_joint_id_maps(semantic_joints, fancy_joints)
+
+        if not joints or max(joints.values()) <= 0.0:
             continue
 
-        joints = _semantic_to_joint_ids(semantic)
         top_bone, bottom_bone = split_level_to_bones(nl)
 
         discs.append(
@@ -267,6 +351,13 @@ def to_api_payload(extracted: ExtractedJson, allowed_levels: Optional[List[str]]
         "bottomright": "joint6",
         "bottomleft": "joint4",
         "center": "joint7",
+    }
+    meta["auto_mapped_from_fancy_features"] = {
+        "canal_stenosis": ["joint7"],
+        "disc_bulge": ["joint7"],
+        "foraminal_narrowing": ["joint2", "joint6", "joint5", "joint4"],
+        "foraminal_narrowing_left": ["joint5", "joint4"],
+        "foraminal_narrowing_right": ["joint2", "joint6"],
     }
 
     return MorphResponse(
