@@ -100,7 +100,7 @@ async def label(req: LabelRequest):
 
 @app.post("/morph", response_model=MorphResponse)
 async def morph(req: MorphRequest):
-    allowed = req.allowed_levels or ["T2-3", "T12-L1"]
+    allowed = req.allowed_levels
     try:
         return process_report_to_payload(
             req.text,
