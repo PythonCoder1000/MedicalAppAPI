@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from anthropic import Anthropic, transform_schema
 from pydantic import ValidationError
 
 from extract import DeidResult, deidentify_report, extract_report
-from schemas import Abnormality, ExtractedJson, JointName, MorphResponse, UnrealDiscJointJson, UnrealDiscJointLevel
+from schemas import Abnormality, DiscOut, ExtractedJson, JointId, JointName, MorphResponse
 
+JOINT_ID_BY_NAME: Dict[JointName, JointId] = {
+    "topright": "joint2",
+    "topleft": "joint5",
+    "bottomright": "joint6",
+    "bottomleft": "joint4",
+    "center": "joint7",
+}
 
 _SPINE_EXTRACT_INSTRUCTIONS = (
-    "Return ONLY valid JSON matching the schema hint.\n"
+    "Return ONLY JSON matching the schema.\n"
     "Extract ONLY abnormal spine levels explicitly described.\n"
     "Do NOT output normal levels.\n"
     "Level format MUST be like T2-3 or T12-L1.\n"
@@ -22,51 +30,18 @@ _SPINE_EXTRACT_INSTRUCTIONS = (
     "Valid laterality values are only left, right, bilateral, midline, unknown.\n"
     "If report says no cord compression or no nerve root impingement, set those globals false.\n"
     "Put non-spine incidental findings into global_findings.incidental.\n"
-    "Put alignment/kyphosis/lordosis notes into global_findings.alignment_notes.\n"
+    "Put alignment notes into global_findings.alignment_notes.\n"
 )
 
-_SPINE_SCHEMA_HINT = {
-    "type": "object",
-    "required": ["levels", "global_findings", "meta"],
-    "properties": {
-        "levels": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["level", "abnormalities"],
-                "properties": {
-                    "level": {"type": "string"},
-                    "abnormalities": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["type", "severity", "notes"],
-                            "properties": {
-                                "type": {"type": "string"},
-                                "severity": {"type": "string"},
-                                "size_mm": {"type": ["number", "null"]},
-                                "laterality": {"type": ["string", "null"]},
-                                "region": {"type": ["string", "null"]},
-                                "notes": {"type": "string"},
-                            },
-                        },
-                    },
-                },
-            },
-        },
-        "global_findings": {
-            "type": "object",
-            "required": ["cord_compression", "nerve_root_impingement", "alignment_notes", "incidental"],
-            "properties": {
-                "cord_compression": {"type": "boolean"},
-                "nerve_root_impingement": {"type": "boolean"},
-                "alignment_notes": {"type": "string"},
-                "incidental": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-        "meta": {"type": "object"},
-    },
-}
+_JSON_ONLY_RE = re.compile(r"(?s)\{.*\}\s*$")
+
+
+def _clamp01(x: float) -> float:
+    if x < 0.0:
+        return 0.0
+    if x > 1.0:
+        return 1.0
+    return x
 
 
 def normalize_level(level: str) -> str:
@@ -86,12 +61,20 @@ def normalize_level(level: str) -> str:
     return replacements.get(s, s)
 
 
-def _clamp01(x: float) -> float:
-    if x < 0.0:
-        return 0.0
-    if x > 1.0:
-        return 1.0
-    return x
+def split_level_to_bones(level: str) -> Tuple[str, str]:
+    lv = normalize_level(level)
+    if "-" not in lv:
+        return lv, lv
+    a, b = lv.split("-", 1)
+    if b and b[0].isdigit():
+        prefix = ""
+        for ch in a:
+            if ch.isalpha():
+                prefix += ch
+            else:
+                break
+        b = prefix + b
+    return a, b
 
 
 def _sev_to_weight(sev: str) -> float:
@@ -194,65 +177,30 @@ def compute_joint_moves(abns: List[Abnormality]) -> Dict[JointName, float]:
     return {k: round(_clamp01(v), 4) for k, v in joints.items()}
 
 
-def _build_skeletal_mesh_controls(levels: List[UnrealDiscJointLevel]) -> Dict[str, float]:
+def _semantic_to_joint_ids(semantic: Dict[JointName, float]) -> Dict[JointId, float]:
+    out: Dict[JointId, float] = {}
+    for k, v in semantic.items():
+        jid = JOINT_ID_BY_NAME[k]
+        out[jid] = float(v)
+    return out
+
+
+def _build_morph_targets(level: str, joints: Dict[JointId, float]) -> Dict[str, float]:
+    tag = normalize_level(level).replace("-", "_")
     out: Dict[str, float] = {}
-    for lvl in levels:
-        tag = lvl.level.replace("-", "_")
-        for joint_name, amount in lvl.joints.items():
-            out[f"disc_{tag}_{joint_name}"] = float(amount)
+    for jid, amount in joints.items():
+        out[f"disc_{tag}_{jid}"] = _clamp01(float(amount))
     return out
 
 
-def _sanitize_extracted_obj(obj: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(obj, dict):
-        return {
-            "levels": [],
-            "global_findings": {
-                "cord_compression": False,
-                "nerve_root_impingement": False,
-                "alignment_notes": "",
-                "incidental": [],
-            },
-            "meta": {},
-        }
-
-    out = dict(obj)
-    if not isinstance(out.get("levels"), list):
-        out["levels"] = []
-
-    for lvl in out["levels"]:
-        if not isinstance(lvl, dict):
-            continue
-        if not isinstance(lvl.get("abnormalities"), list):
-            lvl["abnormalities"] = []
-        for a in lvl["abnormalities"]:
-            if not isinstance(a, dict):
-                continue
-            if "notes" not in a or a["notes"] is None:
-                a["notes"] = ""
-            if "size_mm" in a and a["size_mm"] is not None:
-                try:
-                    a["size_mm"] = float(a["size_mm"])
-                except Exception:
-                    a["size_mm"] = None
-
-    gf = out.get("global_findings")
-    if not isinstance(gf, dict):
-        gf = {}
-        out["global_findings"] = gf
-    if not isinstance(gf.get("cord_compression"), bool):
-        gf["cord_compression"] = False
-    if not isinstance(gf.get("nerve_root_impingement"), bool):
-        gf["nerve_root_impingement"] = False
-    if not isinstance(gf.get("alignment_notes"), str):
-        gf["alignment_notes"] = ""
-    if not isinstance(gf.get("incidental"), list):
-        gf["incidental"] = []
-
-    if not isinstance(out.get("meta"), dict):
-        out["meta"] = {}
-
-    return out
+def _safe_json_load(s: str) -> Optional[Dict[str, Any]]:
+    m = _JSON_ONLY_RE.search((s or "").strip())
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
 
 
 def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -> ExtractedJson:
@@ -271,46 +219,66 @@ def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -
         output_format={"type": "json_schema", "schema": transform_schema(ExtractedJson)},
     )
     raw = resp.content[0].text
-
     try:
         return ExtractedJson.model_validate_json(raw)
     except ValidationError:
-        try:
-            obj = json.loads(raw)
-        except Exception as e:
-            raise RuntimeError(f"AI returned invalid JSON: {e}") from e
-        fixed = _sanitize_extracted_obj(obj)
-        return ExtractedJson.model_validate(fixed)
+        obj = _safe_json_load(raw)
+        if obj is None:
+            raise RuntimeError("AI did not return valid JSON")
+        return ExtractedJson.model_validate(obj)
 
 
-def to_unreal_joint_ready(extracted: ExtractedJson, allowed_levels: Optional[List[str]] = None) -> UnrealDiscJointJson:
+def to_api_payload(extracted: ExtractedJson, allowed_levels: Optional[List[str]] = None, warnings: Optional[List[str]] = None) -> MorphResponse:
     allowed = None
     if allowed_levels:
         allowed = {normalize_level(x) for x in allowed_levels if isinstance(x, str) and x.strip()}
 
-    unreal_levels: List[UnrealDiscJointLevel] = []
+    discs: List[DiscOut] = []
+    morph_targets: Dict[str, float] = {}
+
     for lvl in extracted.levels:
         nl = normalize_level(lvl.level)
         if allowed is not None and nl not in allowed:
             continue
-        joints = compute_joint_moves(lvl.abnormalities)
-        if max(joints.values()) <= 0.0:
+
+        semantic = compute_joint_moves(lvl.abnormalities)
+        if max(semantic.values()) <= 0.0:
             continue
-        unreal_levels.append(UnrealDiscJointLevel(level=nl, joints=joints))
+
+        joints = _semantic_to_joint_ids(semantic)
+        top_bone, bottom_bone = split_level_to_bones(nl)
+
+        discs.append(
+            DiscOut(
+                level=nl,
+                top_bone=top_bone,
+                bottom_bone=bottom_bone,
+                joints=joints,
+            )
+        )
+
+        morph_targets.update(_build_morph_targets(nl, joints))
 
     meta = dict(extracted.meta) if isinstance(extracted.meta, dict) else {}
-    meta["kept_levels"] = [x.level for x in unreal_levels]
-    meta["joint_names"] = ["center", "topright", "bottomright", "topleft", "bottomleft"]
+    meta["kept_levels"] = [d.level for d in discs]
+    meta["joint_map"] = {
+        "topright": "joint2",
+        "topleft": "joint5",
+        "bottomright": "joint6",
+        "bottomleft": "joint4",
+        "center": "joint7",
+    }
 
-    return UnrealDiscJointJson(
-        levels=unreal_levels,
+    return MorphResponse(
+        morph_targets=morph_targets,
+        discs=discs,
         global_findings=extracted.global_findings,
         meta=meta,
-        skeletal_mesh_controls=_build_skeletal_mesh_controls(unreal_levels),
+        warnings=list(warnings or []),
     )
 
 
-def process_report_to_unreal_joints(
+def process_report_to_payload(
     raw_report: str,
     *,
     allowed_levels: Optional[List[str]] = None,
@@ -319,19 +287,8 @@ def process_report_to_unreal_joints(
     deid_api_key: Optional[str] = None,
     extract_model: str = "claude-sonnet-4-5",
     anthropic_api_key: Optional[str] = None,
-) -> tuple[DeidResult, ExtractedJson, UnrealDiscJointJson]:
-    deid = deidentify_report(raw_report, use_ai=deid_with_ai, model=deid_model, api_key=deid_api_key)
+) -> MorphResponse:
+    deid: DeidResult = deidentify_report(raw_report, use_ai=deid_with_ai, model=deid_model, api_key=deid_api_key)
     extracted_text = extract_report(deid.text)
     extracted = ask_spine_model(extracted_text, model=extract_model, api_key=anthropic_api_key)
-    unreal = to_unreal_joint_ready(extracted, allowed_levels=allowed_levels)
-    return deid, extracted, unreal
-
-
-def to_morph_response(unreal: UnrealDiscJointJson, warnings: Optional[List[str]] = None) -> MorphResponse:
-    return MorphResponse(
-        levels=unreal.levels,
-        global_findings=unreal.global_findings,
-        meta=unreal.meta,
-        skeletal_mesh_controls=unreal.skeletal_mesh_controls,
-        warnings=list(warnings or []),
-    )
+    return to_api_payload(extracted, allowed_levels=allowed_levels, warnings=deid.warnings)

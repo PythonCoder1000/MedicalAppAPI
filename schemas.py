@@ -22,7 +22,9 @@ AbnormalityType = Literal[
 ]
 Laterality = Literal["left", "right", "bilateral", "midline", "unknown"]
 Region = Literal["central", "paracentral", "foraminal", "extraforaminal", "unknown"]
+
 JointName = Literal["center", "topright", "bottomright", "topleft", "bottomleft"]
+JointId = Literal["joint2", "joint4", "joint5", "joint6", "joint7"]
 
 
 class LabelRequest(BaseModel):
@@ -170,23 +172,18 @@ class ExtractedJson(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
-class UnrealDiscJointLevel(BaseModel):
+class DiscOut(BaseModel):
     model_config = ConfigDict(extra="forbid")
     level: str
-    joints: Dict[JointName, float] = Field(default_factory=dict)
-
-
-class UnrealDiscJointJson(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    levels: List[UnrealDiscJointLevel] = Field(default_factory=list)
-    global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
-    meta: Dict[str, Any] = Field(default_factory=dict)
-    skeletal_mesh_controls: Dict[str, float] = Field(default_factory=dict)
+    top_bone: str
+    bottom_bone: str
+    joints: Dict[JointId, float] = Field(default_factory=dict)
 
 
 class MorphResponse(BaseModel):
-    levels: List[UnrealDiscJointLevel] = Field(default_factory=list)
+    model_config = ConfigDict(extra="forbid")
+    morph_targets: Dict[str, float] = Field(default_factory=dict)
+    discs: List[DiscOut] = Field(default_factory=list)
     global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
     meta: Dict[str, Any] = Field(default_factory=dict)
-    skeletal_mesh_controls: Dict[str, float] = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)

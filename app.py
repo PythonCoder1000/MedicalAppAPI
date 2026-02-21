@@ -16,7 +16,7 @@ except Exception:
 
 from extract import deidentify_report, extract_report
 from schemas import LabelRequest, LabelResponse, MorphRequest, MorphResponse
-from spine_pipeline import process_report_to_unreal_joints, to_morph_response
+from spine_pipeline import process_report_to_payload
 
 
 APP_TITLE = "Office Ally Medical AI API"
@@ -92,10 +92,7 @@ def health():
 
 @app.post("/label", response_model=LabelResponse)
 async def label(req: LabelRequest):
-    try:
-        deid = await asyncio.to_thread(deidentify_report, req.text, True, DEID_MODEL, None)
-    except TypeError:
-        deid = await asyncio.to_thread(deidentify_report, req.text, use_ai=True, model=DEID_MODEL)
+    deid = await asyncio.to_thread(deidentify_report, req.text, use_ai=True, model=DEID_MODEL, api_key=None)
     extracted_text = extract_report(deid.text)
     labels = await asyncio.to_thread(_ask_label_model, extracted_text)
     return LabelResponse(labels=labels)
@@ -105,14 +102,10 @@ async def label(req: LabelRequest):
 async def morph(req: MorphRequest):
     allowed = req.allowed_levels or ["T2-3", "T12-L1"]
     try:
-        deid, extracted, unreal = await asyncio.to_thread(
-            process_report_to_unreal_joints,
+        return process_report_to_payload(
             req.text,
             allowed_levels=allowed,
             deid_with_ai=req.use_ai_deid,
-            deid_model=DEID_MODEL,
-            extract_model=MORPH_MODEL,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return to_morph_response(unreal, warnings=deid.warnings)
