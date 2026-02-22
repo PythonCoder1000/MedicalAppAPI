@@ -182,8 +182,6 @@ class DiscOut(BaseModel):
 
 class MorphResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    morph_targets: Dict[str, float] = Field(default_factory=dict)
+    morph_targets: Dict[JointId, float] = Field(default_factory=dict)
     discs: List[DiscOut] = Field(default_factory=list)
-    global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
-    meta: Dict[str, Any] = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)

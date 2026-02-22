@@ -18,7 +18,6 @@ from extract import deidentify_report, extract_report
 from schemas import LabelRequest, LabelResponse, MorphRequest, MorphResponse
 from spine_pipeline import process_report_to_payload
 
-
 APP_TITLE = "Office Ally Medical AI API"
 APP_VERSION = "1.0.0"
 
@@ -100,12 +99,14 @@ async def label(req: LabelRequest):
 
 @app.post("/morph", response_model=MorphResponse)
 async def morph(req: MorphRequest):
-    allowed = req.allowed_levels
     try:
-        return process_report_to_payload(
+        return await asyncio.to_thread(
+            process_report_to_payload,
             req.text,
-            allowed_levels=allowed,
+            allowed_levels=req.allowed_levels,
             deid_with_ai=req.use_ai_deid,
+            deid_model=DEID_MODEL,
+            extract_model=MORPH_MODEL,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
