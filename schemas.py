@@ -18,6 +18,7 @@ AbnormalityType = Literal[
     "edema",
     "cord_compression",
     "nerve_root_impingement",
+    "disc_height_loss",
     "other",
 ]
 Laterality = Literal["left", "right", "bilateral", "midline", "unknown"]
@@ -56,18 +57,16 @@ class Abnormality(BaseModel):
             return "other"
         s = str(v).strip().lower().replace(" ", "_").replace("-", "_")
         aliases = {
-            "annular": "annular_bulge",
-            "annularbulge": "annular_bulge",
-            "disc": "disc_bulge",
-            "bulge": "disc_bulge",
-            "discbulge": "disc_bulge",
-            "canal_stenosis": "stenosis",
-            "central_stenosis": "stenosis",
-            "foraminal_compromise": "foraminal_narrowing",
-            "foraminal_stenosis": "foraminal_narrowing",
-            "facet_arthritis": "facet_arthropathy",
-            "nerve_root_compression": "nerve_root_impingement",
-            "root_impingement": "nerve_root_impingement",
+            "disc_height_loss": "disc_height_loss",
+            "disc_height": "disc_height_loss",
+            "disc_space_narrowing": "disc_height_loss",
+            "disc_space_narrowing.": "disc_height_loss",
+            "disc_space_loss": "disc_height_loss",
+            "disc_space_collapse": "disc_height_loss",
+            "disc_collapse": "disc_height_loss",
+            "loss_of_disc_height": "disc_height_loss",
+            "decreased_disc_height": "disc_height_loss",
+            "disc_height_reduction": "disc_height_loss",
         }
         s = aliases.get(s, s)
         allowed = {
