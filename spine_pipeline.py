@@ -9,7 +9,7 @@ from anthropic import Anthropic, transform_schema
 from pydantic import ValidationError
 
 from extract import DeidResult, deidentify_report, extract_report
-from schemas import Abnormality, ExtractedJson, JointId, JointName, MorphResponse, DiscOut
+from schemas import Abnormality, DiscOut, ExtractedJson, JointId, JointName, MorphResponse
 
 JOINT_ID_BY_NAME: Dict[JointName, JointId] = {
     "topright": "joint2",
@@ -18,8 +18,6 @@ JOINT_ID_BY_NAME: Dict[JointName, JointId] = {
     "bottomleft": "joint4",
     "center": "joint7",
 }
-
-ALL_JOINT_IDS: Tuple[JointId, ...] = ("joint2", "joint4", "joint5", "joint6", "joint7")
 
 FEATURE_TO_JOINTS: Dict[str, List[JointId]] = {
     "canal_stenosis": ["joint7"],
@@ -265,11 +263,11 @@ def _merge_joint_id_maps(a: Dict[JointId, float], b: Dict[JointId, float]) -> Di
     return out
 
 
-def _full_joint_dict(joints: Dict[JointId, float]) -> Dict[JointId, float]:
-    out: Dict[JointId, float] = {jid: 0.0 for jid in ALL_JOINT_IDS}
-    for jid, v in joints.items():
-        if jid in out:
-            out[jid] = _clamp01(float(v))
+def _build_morph_targets(level: str, joints: Dict[JointId, float]) -> Dict[str, float]:
+    tag = normalize_level(level).replace("-", "_")
+    out: Dict[str, float] = {}
+    for jid, amount in joints.items():
+        out[f"{jid}_{tag}"] = _clamp01(float(amount))
     return out
 
 
@@ -309,8 +307,8 @@ def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -
 
 
 def to_api_payload(extracted: ExtractedJson, warnings: Optional[List[str]] = None) -> MorphResponse:
-
     discs: List[DiscOut] = []
+    morph_targets: Dict[str, float] = {}
 
     for lvl in extracted.levels:
         nl = normalize_level(lvl.level)
@@ -337,13 +335,19 @@ def to_api_payload(extracted: ExtractedJson, warnings: Optional[List[str]] = Non
             )
         )
 
-    morph_targets = dict(discs[0].joints) if discs else {}
+        morph_targets.update(_build_morph_targets(nl, joints))
+
+    meta = dict(extracted.meta) if isinstance(extracted.meta, dict) else {}
+    meta["kept_levels"] = [d.level for d in discs]
 
     return MorphResponse(
         morph_targets=morph_targets,
         discs=discs,
+        global_findings=extracted.global_findings,
+        meta=meta,
         warnings=list(warnings or []),
     )
+
 
 def process_report_to_payload(
     raw_report: str,
