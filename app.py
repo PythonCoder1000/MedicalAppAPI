@@ -19,7 +19,7 @@ from schemas import LabelRequest, LabelResponse, MorphRequest, MorphResponse
 from spine_pipeline import process_report_to_payload
 
 APP_TITLE = "Office Ally Medical AI API"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 LABEL_MODEL = os.getenv("LABEL_MODEL", "gpt-5-mini")
 DEID_MODEL = os.getenv("DEID_MODEL", "gpt-5-mini")
