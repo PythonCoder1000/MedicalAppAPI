@@ -103,7 +103,6 @@ async def morph(req: MorphRequest):
         return await asyncio.to_thread(
             process_report_to_payload,
             req.text,
-            allowed_levels=req.allowed_levels,
             deid_with_ai=req.use_ai_deid,
             deid_model=DEID_MODEL,
             extract_model=MORPH_MODEL,

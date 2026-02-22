@@ -308,17 +308,12 @@ def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -
         return ExtractedJson.model_validate(obj)
 
 
-def to_api_payload(extracted: ExtractedJson, allowed_levels: Optional[List[str]] = None, warnings: Optional[List[str]] = None) -> MorphResponse:
-    allowed = None
-    if allowed_levels:
-        allowed = {normalize_level(x) for x in allowed_levels if isinstance(x, str) and x.strip()}
+def to_api_payload(extracted: ExtractedJson, warnings: Optional[List[str]] = None) -> MorphResponse:
 
     discs: List[DiscOut] = []
 
     for lvl in extracted.levels:
         nl = normalize_level(lvl.level)
-        if allowed is not None and nl not in allowed:
-            continue
 
         semantic = compute_joint_moves(lvl.abnormalities)
         semantic_joints = _semantic_to_joint_ids(semantic)
@@ -353,7 +348,6 @@ def to_api_payload(extracted: ExtractedJson, allowed_levels: Optional[List[str]]
 def process_report_to_payload(
     raw_report: str,
     *,
-    allowed_levels: Optional[List[str]] = None,
     deid_with_ai: bool = True,
     deid_model: str = "gpt-5-mini",
     deid_api_key: Optional[str] = None,
@@ -363,4 +357,4 @@ def process_report_to_payload(
     deid: DeidResult = deidentify_report(raw_report, use_ai=deid_with_ai, model=deid_model, api_key=deid_api_key)
     extracted_text = extract_report(deid.text)
     extracted = ask_spine_model(extracted_text, model=extract_model, api_key=anthropic_api_key)
-    return to_api_payload(extracted, allowed_levels=allowed_levels, warnings=deid.warnings)
+    return to_api_payload(extracted, warnings=deid.warnings)
