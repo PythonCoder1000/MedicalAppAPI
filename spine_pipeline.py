@@ -3,21 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from anthropic import Anthropic, transform_schema
 from pydantic import ValidationError
 
 from extract import DeidResult, deidentify_report, extract_report
-from schemas import Abnormality, DiscOut, ExtractedJson, JointId, JointName, MorphResponse
-
-JOINT_ID_BY_NAME: Dict[JointName, JointId] = {
-    "topright": "joint2",
-    "topleft": "joint5",
-    "bottomright": "joint6",
-    "bottomleft": "joint4",
-    "center": "joint7",
-}
+from schemas import Abnormality, ExtractedJson, MorphResponse
 
 _SPINE_EXTRACT_INSTRUCTIONS = (
     "Return ONLY JSON matching the schema.\n"
@@ -36,134 +28,76 @@ _SPINE_EXTRACT_INSTRUCTIONS = (
 _JSON_ONLY_RE = re.compile(r"(?s)\{.*\}\s*$")
 
 
-def _clamp_delta(x: float) -> float:
-    if x < -1.0:
-        return -1.0
-    if x > 1.0:
-        return 1.0
-    return x
+def _clamp(x: float) -> float:
+    return max(-1.0, min(1.0, x))
 
 
 def normalize_level(level: str) -> str:
     s = (level or "").strip().upper().replace("–", "-").replace("—", "-").replace(" ", "")
     replacements = {
-        "T2-T3": "T2-3",
-        "T3-T4": "T3-4",
-        "T4-T5": "T4-5",
-        "T5-T6": "T5-6",
-        "T6-T7": "T6-7",
-        "T7-T8": "T7-8",
-        "T8-T9": "T8-9",
-        "T9-T10": "T9-10",
-        "T10-T11": "T10-11",
-        "T11-T12": "T11-12",
+        "T2-T3": "T2-3", "T3-T4": "T3-4", "T4-T5": "T4-5", "T5-T6": "T5-6",
+        "T6-T7": "T6-7", "T7-T8": "T7-8", "T8-T9": "T8-9", "T9-T10": "T9-10",
+        "T10-T11": "T10-11", "T11-T12": "T11-12",
     }
     return replacements.get(s, s)
 
 
-def split_level_to_bones(level: str) -> Tuple[str, str]:
+def _top_bone(level: str) -> str:
     lv = normalize_level(level)
-    if "-" not in lv:
-        return lv, lv
-    a, b = lv.split("-", 1)
-    if b and b[0].isdigit():
-        prefix = ""
-        for ch in a:
-            if ch.isalpha():
-                prefix += ch
-            else:
-                break
-        b = prefix + b
-    return a, b
+    return lv.split("-", 1)[0] if "-" in lv else lv
 
 
 def _sev_to_pos(sev: str) -> float:
-    if sev == "none":
-        return 0.0
-    if sev == "mild":
-        return 0.3
-    if sev == "moderate":
-        return 0.6
-    if sev == "severe":
-        return 1.0
-    return 0.25
+    return {"none": 0.0, "mild": 0.3, "moderate": 0.6, "severe": 1.0}.get(sev, 0.25)
 
 
 def _sev_to_height_loss(sev: str) -> float:
-    if sev == "none":
-        return 0.0
-    if sev == "mild":
-        return 0.2
-    if sev == "moderate":
-        return 0.35
-    if sev == "severe":
-        return 0.5
-    return 0.25
+    return {"none": 0.0, "mild": 0.2, "moderate": 0.35, "severe": 0.5}.get(sev, 0.25)
 
 
 def _vert_from_notes(notes: str) -> str:
     s = (notes or "").lower()
-    top_words = ("superior", "upper", "cranial", "cephalad", "top")
-    bot_words = ("inferior", "lower", "caudal", "caudad", "bottom")
-    has_top = any(w in s for w in top_words)
-    has_bot = any(w in s for w in bot_words)
-    if has_top and not has_bot:
+    top = any(w in s for w in ("superior", "upper", "cranial", "cephalad", "top"))
+    bot = any(w in s for w in ("inferior", "lower", "caudal", "caudad", "bottom"))
+    if top and not bot:
         return "top"
-    if has_bot and not has_top:
+    if bot and not top:
         return "bottom"
     return "both"
 
 
-def _empty_joint_map() -> Dict[JointName, float]:
-    return {
-        "center": 0.0,
-        "topright": 0.0,
-        "bottomright": 0.0,
-        "topleft": 0.0,
-        "bottomleft": 0.0,
-    }
-
-
-def _add_set(d: Dict[JointName, float], key: JointName, value: float) -> None:
-    d[key] = _clamp_delta(float(d.get(key, 0.0)) + float(value))
-
-
-def _apply_side_pair(d: Dict[JointName, float], side: str, value: float, which: str) -> None:
-    v = float(value)
-    if side == "left":
+def _apply_side(joints: List[float], lat: str, v: float, which: str) -> None:
+    # joints layout: [j1_topright, j2_bottomright, j3_bottomleft, j4_topleft, scaler]
+    if lat == "left":
         if which in ("top", "both"):
-            _add_set(d, "topleft", v)
+            joints[3] = _clamp(joints[3] + v)
         if which in ("bottom", "both"):
-            _add_set(d, "bottomleft", v)
-        return
-
-    if side == "right":
+            joints[2] = _clamp(joints[2] + v)
+    elif lat == "right":
         if which in ("top", "both"):
-            _add_set(d, "topright", v)
+            joints[0] = _clamp(joints[0] + v)
         if which in ("bottom", "both"):
-            _add_set(d, "bottomright", v)
-        return
-
-    if side == "bilateral":
+            joints[1] = _clamp(joints[1] + v)
+    elif lat == "bilateral":
         if which in ("top", "both"):
-            _add_set(d, "topleft", v)
-            _add_set(d, "topright", v)
+            joints[0] = _clamp(joints[0] + v)
+            joints[3] = _clamp(joints[3] + v)
         if which in ("bottom", "both"):
-            _add_set(d, "bottomleft", v)
-            _add_set(d, "bottomright", v)
-        return
+            joints[1] = _clamp(joints[1] + v)
+            joints[2] = _clamp(joints[2] + v)
+    else:
+        v2 = v * 0.7
+        if which in ("top", "both"):
+            joints[0] = _clamp(joints[0] + v2)
+            joints[3] = _clamp(joints[3] + v2)
+        if which in ("bottom", "both"):
+            joints[1] = _clamp(joints[1] + v2)
+            joints[2] = _clamp(joints[2] + v2)
 
-    v2 = v * 0.7
-    if which in ("top", "both"):
-        _add_set(d, "topleft", v2)
-        _add_set(d, "topright", v2)
-    if which in ("bottom", "both"):
-        _add_set(d, "bottomleft", v2)
-        _add_set(d, "bottomright", v2)
 
-
-def compute_joint_moves(abns: List[Abnormality]) -> Dict[JointName, float]:
-    joints = _empty_joint_map()
+def compute_joint_moves(abns: List[Abnormality]) -> List[float]:
+    # [j1_topright, j2_bottomright, j3_bottomleft, j4_topleft, scaler]
+    joints = [0.0, 0.0, 0.0, 0.0, 0.0]
 
     for a in abns:
         lat = a.laterality or "unknown"
@@ -172,81 +106,55 @@ def compute_joint_moves(abns: List[Abnormality]) -> Dict[JointName, float]:
 
         if a.type == "disc_height_loss":
             mag = _sev_to_height_loss(a.severity)
-            neg = -mag
-            _add_set(joints, "center", neg * 0.3)
-            _apply_side_pair(joints, lat if lat != "midline" else "unknown", neg, which)
+            joints[4] = _clamp(joints[4] + (-mag * 0.3))
+            _apply_side(joints, lat if lat != "midline" else "unknown", -mag, which)
             continue
 
         sev_w = _sev_to_pos(a.severity)
-        size_w = _clamp_delta(float(a.size_mm) / 5.0) if isinstance(a.size_mm, (int, float)) else None
+        size_w = _clamp(float(a.size_mm) / 5.0) if isinstance(a.size_mm, (int, float)) else None
 
         if a.type in ("annular_bulge", "disc_bulge"):
             w = size_w if size_w is not None else max(sev_w, 0.2)
             if region in ("foraminal", "extraforaminal"):
-                _apply_side_pair(joints, lat, w, which)
+                _apply_side(joints, lat, w, which)
             elif region == "paracentral":
-                _add_set(joints, "center", w * 0.8)
-                _apply_side_pair(joints, lat, w * 0.8 if lat in ("left", "right", "bilateral") else w * 0.5, which)
+                joints[4] = _clamp(joints[4] + w * 0.8)
+                _apply_side(joints, lat, w * 0.8 if lat in ("left", "right", "bilateral") else w * 0.5, which)
             else:
-                _add_set(joints, "center", w)
+                joints[4] = _clamp(joints[4] + w)
             continue
 
         if a.type == "stenosis":
-            _add_set(joints, "center", sev_w)
+            joints[4] = _clamp(joints[4] + sev_w)
             continue
 
         if a.type == "foraminal_narrowing":
-            _apply_side_pair(joints, lat, sev_w if sev_w > 0 else 0.2, which)
+            _apply_side(joints, lat, sev_w if sev_w > 0 else 0.2, which)
             continue
 
         if a.type in ("protrusion", "extrusion"):
             w = size_w if size_w is not None else max(sev_w, 0.4)
             if region in ("central", "unknown"):
-                _add_set(joints, "center", w)
+                joints[4] = _clamp(joints[4] + w)
             elif region == "paracentral":
-                _add_set(joints, "center", w * 0.75)
-                _apply_side_pair(joints, lat, w, which)
+                joints[4] = _clamp(joints[4] + w * 0.75)
+                _apply_side(joints, lat, w, which)
             else:
-                _apply_side_pair(joints, lat, w, which)
+                _apply_side(joints, lat, w, which)
             continue
 
         if a.type == "facet_arthropathy":
-            _apply_side_pair(joints, lat, max(sev_w, 0.2), which)
+            _apply_side(joints, lat, max(sev_w, 0.2), which)
             continue
 
         if a.type == "cord_compression":
-            _add_set(joints, "center", max(sev_w, 0.8))
+            joints[4] = _clamp(joints[4] + max(sev_w, 0.8))
             continue
 
         if a.type == "nerve_root_impingement":
-            _apply_side_pair(joints, lat, max(sev_w, 0.7), which)
+            _apply_side(joints, lat, max(sev_w, 0.7), which)
 
-    return {k: round(_clamp_delta(v), 4) for k, v in joints.items()}
-
-
-def _semantic_to_joint_ids(semantic: Dict[JointName, float]) -> Dict[JointId, float]:
-    out: Dict[JointId, float] = {}
-    for k, v in semantic.items():
-        out[JOINT_ID_BY_NAME[k]] = float(v)
-    return out
-
-
-def _build_morph_targets(level: str, joints: Dict[JointId, float]) -> Dict[str, float]:
-    tag = normalize_level(level).replace("-", "_")
-    out: Dict[str, float] = {}
-    for jid, amount in joints.items():
-        out[f"{jid}_{tag}"] = round(_clamp_delta(float(amount)), 4)
-    return out
-
-
-def _safe_json_load(s: str) -> Optional[Dict[str, Any]]:
-    m = _JSON_ONLY_RE.search((s or "").strip())
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
+    return [round(_clamp(v), 4) for v in joints]
 
 
 def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -> ExtractedJson:
@@ -268,44 +176,26 @@ def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -
     try:
         return ExtractedJson.model_validate_json(raw)
     except ValidationError:
-        obj = _safe_json_load(raw)
-        if obj is None:
+        m = _JSON_ONLY_RE.search((raw or "").strip())
+        if m is None:
             raise RuntimeError("AI did not return valid JSON")
-        return ExtractedJson.model_validate(obj)
+        return ExtractedJson.model_validate(json.loads(m.group(0)))
 
 
 def to_api_payload(extracted: ExtractedJson, warnings: Optional[List[str]] = None) -> MorphResponse:
-    discs: List[DiscOut] = []
-    morph_targets: Dict[str, float] = {}
+    morph_targets: Dict[str, List[float]] = {}
 
     for lvl in extracted.levels:
-        nl = normalize_level(lvl.level)
-
-        semantic = compute_joint_moves(lvl.abnormalities)
-        joints = _semantic_to_joint_ids(semantic)
-
-        if not joints or max(abs(v) for v in joints.values()) <= 0.0:
+        joints = compute_joint_moves(lvl.abnormalities)
+        if max(abs(v) for v in joints) <= 0.0:
             continue
-
-        top_bone, bottom_bone = split_level_to_bones(nl)
-
-        discs.append(
-            DiscOut(
-                level=nl,
-                top_bone=top_bone,
-                bottom_bone=bottom_bone,
-                joints=joints,
-            )
-        )
-
-        morph_targets.update(_build_morph_targets(nl, joints))
+        morph_targets[_top_bone(lvl.level)] = joints
 
     meta = dict(extracted.meta) if isinstance(extracted.meta, dict) else {}
-    meta["kept_levels"] = [d.level for d in discs]
+    meta["kept_levels"] = list(morph_targets.keys())
 
     return MorphResponse(
         morph_targets=morph_targets,
-        discs=discs,
         global_findings=extracted.global_findings,
         meta=meta,
         warnings=list(warnings or []),
