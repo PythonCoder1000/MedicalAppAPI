@@ -42,9 +42,13 @@ def normalize_level(level: str) -> str:
     return replacements.get(s, s)
 
 
-def _top_bone(level: str) -> str:
+def _disc_name(level: str) -> str:
     lv = normalize_level(level)
-    return lv.split("-", 1)[0] if "-" in lv else lv
+    if "-" not in lv:
+        return lv
+    a, b = lv.split("-", 1)
+    prefix = "".join(c for c in a if c.isalpha())
+    return b if b[0].isalpha() else prefix + b
 
 
 def _sev_to_pos(sev: str) -> float:
@@ -189,7 +193,7 @@ def to_api_payload(extracted: ExtractedJson, warnings: Optional[List[str]] = Non
         joints = compute_joint_moves(lvl.abnormalities)
         if max(abs(v) for v in joints) <= 0.0:
             continue
-        morph_targets[_top_bone(lvl.level)] = joints
+        morph_targets[_disc_name(lvl.level)] = joints
 
     meta = dict(extracted.meta) if isinstance(extracted.meta, dict) else {}
     meta["kept_levels"] = list(morph_targets.keys())
