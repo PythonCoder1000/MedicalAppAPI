@@ -25,6 +25,29 @@ _SPINE_EXTRACT_INSTRUCTIONS = (
     "Put alignment notes into global_findings.alignment_notes.\n"
 )
 
+_MORPH_INSTRUCTIONS = """You are a spine radiologist and biomechanical expert.
+
+Given structured spine pathology findings and a heuristic baseline, produce accurate disc morphing displacement values for a 3D visualization. Use web search to look up realistic displacement magnitudes for specific pathology types and severities when needed.
+
+Joint layout for each disc (5 values, range -1.0 to 1.0):
+  index 0: joint1 = top-right corner
+  index 1: joint2 = bottom-right corner
+  index 2: joint3 = bottom-left corner
+  index 3: joint4 = top-left corner
+  index 4: scaler = uniform whole-disc size change
+
+Rules:
+- Positive = expansion/protrusion outward, negative = compression/collapse
+- Laterality determines which corner joints are affected (left → indices 2,3 / right → indices 0,1 / bilateral → all)
+- Region determines distribution (central → scaler / foraminal → corner joints / paracentral → both)
+- Severity and size_mm calibrate magnitude
+- Disc name must use the bottom vertebra (L4-L5 → "L5", T12-L1 → "L1")
+
+The heuristic_baseline is a reasonable starting point — improve it using real biomechanical data.
+
+Return ONLY valid JSON:
+{"morph_targets": {"DISC": [j1, j2, j3, j4, scaler], ...}}"""
+
 _JSON_ONLY_RE = re.compile(r"(?s)\{.*\}\s*$")
 
 
@@ -71,7 +94,6 @@ def _vert_from_notes(notes: str) -> str:
 
 
 def _apply_side(joints: List[float], lat: str, v: float, which: str) -> None:
-    # joints layout: [j1_topright, j2_bottomright, j3_bottomleft, j4_topleft, scaler]
     if lat == "left":
         if which in ("top", "both"):
             joints[3] = _clamp(joints[3] + v)
@@ -100,7 +122,6 @@ def _apply_side(joints: List[float], lat: str, v: float, which: str) -> None:
 
 
 def compute_joint_moves(abns: List[Abnormality]) -> List[float]:
-    # [j1_topright, j2_bottomright, j3_bottomleft, j4_topleft, scaler]
     joints = [0.0, 0.0, 0.0, 0.0, 0.0]
 
     for a in abns:
@@ -186,17 +207,55 @@ def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -
         return ExtractedJson.model_validate(json.loads(m.group(0)))
 
 
-def to_api_payload(extracted: ExtractedJson, warnings: Optional[List[str]] = None) -> MorphResponse:
-    morph_targets: Dict[str, List[float]] = {}
+def ask_morph_model(
+    extracted: ExtractedJson,
+    heuristic: Dict[str, List[float]],
+    *,
+    model: str,
+    api_key: Optional[str] = None,
+) -> tuple[Dict[str, List[float]], str]:
+    client = Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
 
-    for lvl in extracted.levels:
-        joints = compute_joint_moves(lvl.abnormalities)
-        if max(abs(v) for v in joints) <= 0.0:
-            continue
-        morph_targets[_disc_name(lvl.level)] = joints
+    resp = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        system=_MORPH_INSTRUCTIONS,
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+        messages=[{
+            "role": "user",
+            "content": json.dumps({
+                "findings": extracted.model_dump(exclude_defaults=True),
+                "heuristic_baseline": heuristic,
+            }, indent=2),
+        }],
+    )
 
+    text = next((b.text for b in resp.content if hasattr(b, "text")), "")
+    m = _JSON_ONLY_RE.search(text.strip())
+    if not m:
+        return heuristic, "heuristic"
+
+    try:
+        raw = json.loads(m.group(0)).get("morph_targets", {})
+        refined = {
+            k: [round(_clamp(float(v)), 4) for v in vals]
+            for k, vals in raw.items()
+            if isinstance(vals, list) and len(vals) == 5
+        }
+        return (refined, "ai") if refined else (heuristic, "heuristic")
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return heuristic, "heuristic"
+
+
+def to_api_payload(
+    extracted: ExtractedJson,
+    morph_targets: Dict[str, List[float]],
+    morph_source: str = "heuristic",
+    warnings: Optional[List[str]] = None,
+) -> MorphResponse:
     meta = dict(extracted.meta) if isinstance(extracted.meta, dict) else {}
     meta["kept_levels"] = list(morph_targets.keys())
+    meta["morph_source"] = morph_source
 
     return MorphResponse(
         morph_targets=morph_targets,
@@ -218,4 +277,13 @@ def process_report_to_payload(
     deid: DeidResult = deidentify_report(raw_report, use_ai=deid_with_ai, model=deid_model, api_key=deid_api_key)
     extracted_text = extract_report(deid.text)
     extracted = ask_spine_model(extracted_text, model=extract_model, api_key=anthropic_api_key)
-    return to_api_payload(extracted, warnings=deid.warnings)
+
+    heuristic: Dict[str, List[float]] = {
+        _disc_name(lvl.level): compute_joint_moves(lvl.abnormalities)
+        for lvl in extracted.levels
+        if max(abs(v) for v in compute_joint_moves(lvl.abnormalities)) > 0.0
+    }
+
+    morph_targets, morph_source = ask_morph_model(extracted, heuristic, model=extract_model, api_key=anthropic_api_key)
+
+    return to_api_payload(extracted, morph_targets, morph_source=morph_source, warnings=deid.warnings)
