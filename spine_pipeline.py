@@ -67,11 +67,7 @@ def normalize_level(level: str) -> str:
 
 def _disc_name(level: str) -> str:
     lv = normalize_level(level)
-    if "-" not in lv:
-        return lv
-    a, b = lv.split("-", 1)
-    prefix = "".join(c for c in a if c.isalpha())
-    return b if b[0].isalpha() else prefix + b
+    return lv.split("-", 1)[0] if "-" in lv else lv
 
 
 def _sev_to_pos(sev: str) -> float:
