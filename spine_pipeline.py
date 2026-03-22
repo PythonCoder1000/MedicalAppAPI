@@ -25,27 +25,33 @@ _SPINE_EXTRACT_INSTRUCTIONS = (
     "Put alignment notes into global_findings.alignment_notes.\n"
 )
 
-_MORPH_INSTRUCTIONS = """You are a spine radiologist and biomechanical expert.
+_MORPH_INSTRUCTIONS = """You are a spine radiologist and biomechanical expert producing disc morphing values for a 3D visualization.
 
-Given structured spine pathology findings and a heuristic baseline, produce accurate disc morphing displacement values for a 3D visualization. Use web search to look up realistic displacement magnitudes for specific pathology types and severities when needed.
+You will receive:
+- "findings": structured pathology data extracted from a radiology report
+- "heuristic_baseline": a rule-based estimate — use it only as a directional reference, NOT as a starting point for magnitude. The heuristic is known to significantly over-scale values.
 
-Joint layout for each disc (5 values, range -1.0 to 1.0):
+Your job: use web search to look up real measured disc displacement data from trusted medical sources (PubMed, Spine journal, AJNR, Radiology, RSNA, SpineUniverse, or similar) to determine accurate magnitudes. Ground every value in real biomechanics.
+
+Joint layout per disc — 5 float values in range -1.0 to 1.0:
   index 0: joint1 = top-right corner
   index 1: joint2 = bottom-right corner
   index 2: joint3 = bottom-left corner
   index 3: joint4 = top-left corner
   index 4: scaler = uniform whole-disc size change
 
-Rules:
-- Positive = expansion/protrusion outward, negative = compression/collapse
-- Laterality determines which corner joints are affected (left → indices 2,3 / right → indices 0,1 / bilateral → all)
-- Region determines distribution (central → scaler / foraminal → corner joints / paracentral → both)
-- Severity and size_mm calibrate magnitude
-- Disc name must use the bottom vertebra (L4-L5 → "L5", T12-L1 → "L1")
+Calibration rules:
+- Values represent normalized displacement (1.0 = maximum clinically observed, not average)
+- Most findings should produce modest values (0.1–0.4). Reserve 0.7–1.0 for truly severe/extreme cases.
+- Positive = outward expansion/protrusion. Negative = collapse/height loss.
+- Laterality → which corners move (left: indices 2,3 / right: indices 0,1 / bilateral: all four)
+- Region → distribution (central: scaler only / foraminal: corner joints only / paracentral: both, weighted)
+- size_mm is the most reliable calibration signal when present — search for typical displacement ranges by pathology type and size
+- Severity without size: mild→0.1-0.2, moderate→0.25-0.4, severe→0.5-0.7
 
-The heuristic_baseline is a reasonable starting point — improve it using real biomechanical data.
+Search strategy: for each distinct pathology type present, search for measured posterior disc displacement or canal compromise by severity to calibrate your values. Prefer quantitative studies.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON (no explanation, no markdown):
 {"morph_targets": {"DISC": [j1, j2, j3, j4, scaler], ...}}"""
 
 _JSON_ONLY_RE = re.compile(r"(?s)\{.*\}\s*$")
@@ -214,14 +220,15 @@ def ask_morph_model(
 
     resp = client.messages.create(
         model=model,
-        max_tokens=1024,
+        max_tokens=2048,
         system=_MORPH_INSTRUCTIONS,
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
         messages=[{
             "role": "user",
             "content": json.dumps({
                 "findings": extracted.model_dump(exclude_defaults=True),
                 "heuristic_baseline": heuristic,
+                "note": "The heuristic baseline is known to over-scale. Use web search to find real measured displacement values and produce conservative, medically grounded results.",
             }, indent=2),
         }],
     )
