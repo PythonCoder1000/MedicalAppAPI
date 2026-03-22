@@ -25,31 +25,40 @@ _SPINE_EXTRACT_INSTRUCTIONS = (
     "Put alignment notes into global_findings.alignment_notes.\n"
 )
 
-_MORPH_INSTRUCTIONS = """You are a spine radiologist and biomechanical expert producing disc morphing values for a 3D visualization.
+_MORPH_INSTRUCTIONS = """You are a spine radiologist and biomechanical expert producing disc morphing values for a UE5 skeletal joint visualization.
+
+CRITICAL CONTEXT — UE5 processing:
+- Your output values are ADDED to 1.0 in Unreal Engine (bone scale base = 1.0).
+- So a value of 0.0 means no change, 0.2 means the joint scales to 1.2, -0.1 means 0.9.
+- This means even small values produce visible deformation. DO NOT output large values.
 
 You will receive:
-- "findings": structured pathology data extracted from a radiology report
-- "heuristic_baseline": a rule-based estimate — use it only as a directional reference, NOT as a starting point for magnitude. The heuristic is known to significantly over-scale values.
+- "findings": structured pathology from a radiology report
+- "heuristic_baseline": a rule-based estimate (directional reference only, known to over-scale)
 
-Your job: use web search to look up real measured disc displacement data from trusted medical sources (PubMed, Spine journal, AJNR, Radiology, RSNA, SpineUniverse, or similar) to determine accurate magnitudes. Ground every value in real biomechanics.
+Your job: use web search to look up real measured disc displacement data from trusted sources (PubMed, Spine journal, AJNR, Radiology, RSNA) to calibrate magnitudes.
 
-Joint layout per disc — 5 float values in range -1.0 to 1.0:
+Joint layout per disc — 5 float values:
   index 0: joint1 = top-right corner
   index 1: joint2 = bottom-right corner
   index 2: joint3 = bottom-left corner
   index 3: joint4 = top-left corner
   index 4: scaler = uniform whole-disc size change
 
-Calibration rules:
-- Values represent normalized displacement (1.0 = maximum clinically observed, not average)
-- Most findings should produce modest values (0.1–0.4). Reserve 0.7–1.0 for truly severe/extreme cases.
-- Positive = outward expansion/protrusion. Negative = collapse/height loss.
-- Laterality → which corners move (left: indices 2,3 / right: indices 0,1 / bilateral: all four)
-- Region → distribution (central: scaler only / foraminal: corner joints only / paracentral: both, weighted)
-- size_mm is the most reliable calibration signal when present — search for typical displacement ranges by pathology type and size
-- Severity without size: mild→0.1-0.2, moderate→0.25-0.4, severe→0.5-0.7
+HARD LIMITS — every value MUST be between -0.5 and 0.5. No exceptions.
 
-Search strategy: for each distinct pathology type present, search for measured posterior disc displacement or canal compromise by severity to calibrate your values. Prefer quantitative studies.
+Calibration:
+- mild → 0.03–0.08
+- moderate → 0.08–0.18
+- severe → 0.18–0.35
+- catastrophic/extreme → 0.35–0.5 (rare)
+- Most findings should be 0.05–0.2. Values above 0.3 are unusual.
+- Positive = outward expansion/protrusion. Negative = collapse/height loss.
+- Laterality → which corners (left: indices 2,3 / right: indices 0,1 / bilateral: all four)
+- Region → distribution (central: scaler / foraminal: corners / paracentral: both weighted)
+- size_mm when present: normalize against typical disc AP diameter (~35mm). A 6mm protrusion ≈ 0.17.
+
+Search strategy: for each distinct pathology type, search for measured displacement ranges to calibrate. Prefer quantitative studies.
 
 Return ONLY valid JSON (no explanation, no markdown):
 {"morph_targets": {"DISC": [j1, j2, j3, j4, scaler], ...}}"""
@@ -58,7 +67,7 @@ _JSON_ONLY_RE = re.compile(r"(?s)\{.*\}\s*$")
 
 
 def _clamp(x: float) -> float:
-    return max(-1.0, min(1.0, x))
+    return max(-0.5, min(0.5, x))
 
 
 def normalize_level(level: str) -> str:
@@ -77,11 +86,11 @@ def _disc_name(level: str) -> str:
 
 
 def _sev_to_pos(sev: str) -> float:
-    return {"none": 0.0, "mild": 0.3, "moderate": 0.6, "severe": 1.0}.get(sev, 0.25)
+    return {"none": 0.0, "mild": 0.1, "moderate": 0.2, "severe": 0.35}.get(sev, 0.1)
 
 
 def _sev_to_height_loss(sev: str) -> float:
-    return {"none": 0.0, "mild": 0.2, "moderate": 0.35, "severe": 0.5}.get(sev, 0.25)
+    return {"none": 0.0, "mild": 0.08, "moderate": 0.15, "severe": 0.25}.get(sev, 0.1)
 
 
 def _vert_from_notes(notes: str) -> str:
@@ -138,17 +147,17 @@ def compute_joint_moves(abns: List[Abnormality]) -> List[float]:
             continue
 
         sev_w = _sev_to_pos(a.severity)
-        size_w = _clamp(float(a.size_mm) / 5.0) if isinstance(a.size_mm, (int, float)) else None
+        size_w = _clamp(float(a.size_mm) / 15.0) if isinstance(a.size_mm, (int, float)) else None
 
         if a.type in ("annular_bulge", "disc_bulge"):
-            w = size_w if size_w is not None else max(sev_w, 0.2)
+            w = size_w if size_w is not None else max(sev_w, 0.08)
             if region in ("foraminal", "extraforaminal"):
                 _apply_side(joints, lat, w, which)
             elif region == "paracentral":
-                joints[4] = _clamp(joints[4] + w * 0.8)
-                _apply_side(joints, lat, w * 0.8 if lat in ("left", "right", "bilateral") else w * 0.5, which)
+                joints[4] = _clamp(joints[4] + w * 0.5)
+                _apply_side(joints, lat, w * 0.5 if lat in ("left", "right", "bilateral") else w * 0.3, which)
             else:
-                joints[4] = _clamp(joints[4] + w)
+                joints[4] = _clamp(joints[4] + w * 0.6)
             continue
 
         if a.type == "stenosis":
@@ -156,30 +165,30 @@ def compute_joint_moves(abns: List[Abnormality]) -> List[float]:
             continue
 
         if a.type == "foraminal_narrowing":
-            _apply_side(joints, lat, sev_w if sev_w > 0 else 0.2, which)
+            _apply_side(joints, lat, sev_w if sev_w > 0 else 0.08, which)
             continue
 
         if a.type in ("protrusion", "extrusion"):
-            w = size_w if size_w is not None else max(sev_w, 0.4)
+            w = size_w if size_w is not None else max(sev_w, 0.15)
             if region in ("central", "unknown"):
-                joints[4] = _clamp(joints[4] + w)
+                joints[4] = _clamp(joints[4] + w * 0.7)
             elif region == "paracentral":
-                joints[4] = _clamp(joints[4] + w * 0.75)
-                _apply_side(joints, lat, w, which)
+                joints[4] = _clamp(joints[4] + w * 0.5)
+                _apply_side(joints, lat, w * 0.7, which)
             else:
                 _apply_side(joints, lat, w, which)
             continue
 
         if a.type == "facet_arthropathy":
-            _apply_side(joints, lat, max(sev_w, 0.2), which)
+            _apply_side(joints, lat, max(sev_w, 0.08), which)
             continue
 
         if a.type == "cord_compression":
-            joints[4] = _clamp(joints[4] + max(sev_w, 0.8))
+            joints[4] = _clamp(joints[4] + max(sev_w, 0.3))
             continue
 
         if a.type == "nerve_root_impingement":
-            _apply_side(joints, lat, max(sev_w, 0.7), which)
+            _apply_side(joints, lat, max(sev_w, 0.25), which)
 
     return [round(_clamp(v), 4) for v in joints]
 
@@ -228,7 +237,7 @@ def ask_morph_model(
             "content": json.dumps({
                 "findings": extracted.model_dump(exclude_defaults=True),
                 "heuristic_baseline": heuristic,
-                "note": "The heuristic baseline is known to over-scale. Use web search to find real measured displacement values and produce conservative, medically grounded results.",
+                "note": "Values are added to 1.0 in UE5 bone scale. Keep all values between -0.5 and 0.5. Most should be 0.05-0.2. The heuristic over-scales badly — use web search for real data.",
             }, indent=2),
         }],
     )
