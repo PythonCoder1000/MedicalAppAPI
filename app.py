@@ -10,7 +10,7 @@ from schemas import MorphRequest, MorphResponse
 from spine_pipeline import process_report_to_payload
 
 APP_TITLE = "Office Ally Medical AI API"
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.1.3"
 
 DEID_MODEL = os.getenv("DEID_MODEL", "gpt-5-mini")
 MORPH_MODEL = os.getenv("MORPH_MODEL", "claude-sonnet-4-5")
