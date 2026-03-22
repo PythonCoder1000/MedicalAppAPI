@@ -134,9 +134,15 @@ class ExtractedJson(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
+class DiscMorph(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    values: List[float]
+
+
 class MorphResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    morph_targets: Dict[str, List[float]] = Field(default_factory=dict)
+    morph_targets: List[DiscMorph] = Field(default_factory=list)
     global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
     meta: Dict[str, Any] = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)

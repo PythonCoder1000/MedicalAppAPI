@@ -9,7 +9,7 @@ from anthropic import Anthropic, transform_schema
 from pydantic import ValidationError
 
 from extract import DeidResult, deidentify_report, extract_report
-from schemas import Abnormality, ExtractedJson, MorphResponse
+from schemas import Abnormality, DiscMorph, ExtractedJson, MorphResponse
 
 _SPINE_EXTRACT_INSTRUCTIONS = (
     "Return ONLY JSON matching the schema.\n"
@@ -254,7 +254,7 @@ def to_api_payload(
     meta["morph_source"] = morph_source
 
     return MorphResponse(
-        morph_targets=morph_targets,
+        morph_targets=[DiscMorph(name=k, values=v) for k, v in morph_targets.items()],
         global_findings=extracted.global_findings,
         meta=meta,
         warnings=list(warnings or []),
