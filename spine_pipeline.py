@@ -3,197 +3,137 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from anthropic import Anthropic, transform_schema
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from extract import DeidResult, deidentify_report, extract_report
-from schemas import Abnormality, DiscMorph, ExtractedJson, MorphResponse
+from schemas import Abnormality, DiscMorph, GlobalFindings, MorphResponse
 
-_SPINE_EXTRACT_INSTRUCTIONS = (
-    "Return ONLY JSON matching the schema.\n"
-    "Extract ONLY abnormal spine levels explicitly described.\n"
-    "Do NOT output normal levels.\n"
-    "Level format MUST be like T12-L1.\n"
-    "For each abnormal level, output abnormalities with fields type, severity, size_mm, laterality, region, notes.\n"
-    "Valid region values are only central, paracentral, foraminal, extraforaminal, unknown.\n"
-    "Valid laterality values are only left, right, bilateral, midline, unknown.\n"
-    "Use type='disc_height_loss' when the report states disc height loss, disc space narrowing, or disc collapse.\n"
-    "If report says no cord compression or no nerve root impingement, set those globals false.\n"
-    "Put non-spine incidental findings into global_findings.incidental.\n"
-    "Put alignment notes into global_findings.alignment_notes.\n"
+
+class _LevelMorph(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    level: str
+    abnormalities: List[Abnormality] = Field(default_factory=list)
+    morph: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0])
+
+
+class _CombinedExtraction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    levels: List[_LevelMorph] = Field(default_factory=list)
+    global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
+
+
+_SYSTEM = (
+    "You are a spine MRI radiologist. Extract abnormal findings from the report "
+    "and produce disc morph values for a UE5 skeletal mesh visualization.\n\n"
+
+    "FOR EACH ABNORMAL LEVEL output:\n"
+    "- level: format like L4-L5 or T12-L1\n"
+    "- abnormalities: each with type, severity, size_mm, laterality, region, notes\n"
+    "- morph: exactly 5 floats [joint1_topright, joint2_bottomright, "
+    "joint3_bottomleft, joint4_topleft, scaler]. Range -1.0 to 1.0.\n\n"
+
+    "UE5 BONE SCALE CONTEXT (critical for correct visual output):\n"
+    "- Each morph value is ADDED to 1.0 to become the bone scale.\n"
+    "- Corner joints (indices 0-3) scale ALL 3 AXES simultaneously.\n"
+    "  A corner value of 0.2 produces scale 1.2 per axis = 1.2^3 = 1.73x volume.\n"
+    "  A corner value of 0.3 produces 1.3^3 = 2.2x volume — very large visually.\n"
+    "  THEREFORE corner values must be conservative. Most should be 0.03-0.15.\n"
+    "- Scaler (index 4) scales the ENTIRE disc HEIGHT ONLY (single Y axis).\n"
+    "  Positive scaler = taller/thicker disc. Negative = shorter/thinner disc.\n"
+    "  Scaler can tolerate larger values since it is single-axis.\n\n"
+
+    "PATHOLOGY-TO-MORPH MAPPING TABLE (corner values are small due to cubic scaling):\n\n"
+
+    "disc_bulge / annular_bulge:\n"
+    "  central → scaler only: mild 0.04, moderate 0.08, severe 0.12\n"
+    "  paracentral → affected corners 0.04-0.10 + scaler at half\n"
+    "  foraminal → affected corners only: mild 0.05, moderate 0.10, severe 0.15\n\n"
+
+    "protrusion:\n"
+    "  central → scaler: mild 0.06, moderate 0.12, severe 0.18\n"
+    "  paracentral → affected corners 0.06-0.15 + scaler at 60%\n"
+    "  foraminal → affected corners: mild 0.08, moderate 0.15, severe 0.22\n\n"
+
+    "extrusion:\n"
+    "  central → scaler: mild 0.10, moderate 0.18, severe 0.28\n"
+    "  paracentral → affected corners 0.10-0.22 + scaler at half\n"
+    "  foraminal → affected corners: mild 0.12, moderate 0.20, severe 0.30\n\n"
+
+    "disc_height_loss → SCALER ONLY (always negative): mild -0.08, moderate -0.18, severe -0.30\n"
+    "  NEVER apply disc height loss to corner joints. It is uniform disc thinning.\n\n"
+
+    "stenosis → scaler only: mild 0.04, moderate 0.08, severe 0.14\n"
+    "foraminal_narrowing → affected corners: mild 0.04, moderate 0.08, severe 0.14\n"
+    "cord_compression → scaler: moderate 0.15, severe 0.25\n"
+    "nerve_root_impingement → affected corners: mild 0.06, moderate 0.12, severe 0.20\n"
+    "facet_arthropathy → affected corners: mild 0.03, moderate 0.06, severe 0.10\n\n"
+
+    "SIZE CALIBRATION (when size_mm is available):\n"
+    "  corner value ≈ (size_mm / 35.0) × 0.5\n"
+    "  Example: 6mm protrusion → (6/35) × 0.5 ≈ 0.086\n\n"
+
+    "LATERALITY → which corners are affected:\n"
+    "  left → indices 2 (bottom-left) and 3 (top-left)\n"
+    "  right → indices 0 (top-right) and 1 (bottom-right)\n"
+    "  bilateral → all four corners at full magnitude\n"
+    "  midline/unknown → all four corners at 60% magnitude\n\n"
+
+    "DISC NAMING: use the TOP vertebra. L4-L5 → disc named L4. T12-L1 → disc named T12.\n\n"
+
+    "RULES:\n"
+    "- Extract ONLY explicitly described abnormal levels.\n"
+    "- Do NOT output levels described as normal.\n"
+    "- Do NOT invent or hallucinate findings.\n"
+    "- When the report is ambiguous or vague, prefer lower morph values.\n"
+    "- Corner values should rarely exceed ±0.25. Scaler rarely exceeds ±0.35.\n"
+    "- Use disc_height_loss when report says disc height loss, disc space narrowing, "
+    "or disc collapse.\n"
+    "- Set global_findings.cord_compression and nerve_root_impingement booleans.\n"
+    "- Put incidental non-spine findings in global_findings.incidental.\n"
+    "- Put alignment notes in global_findings.alignment_notes.\n"
+    "- Valid types: annular_bulge, disc_bulge, protrusion, extrusion, stenosis, "
+    "foraminal_narrowing, facet_arthropathy, alignment, fracture, edema, "
+    "cord_compression, nerve_root_impingement, disc_height_loss, other\n"
+    "- Valid severities: none, mild, moderate, severe, unknown\n"
+    "- Valid lateralities: left, right, bilateral, midline, unknown\n"
+    "- Valid regions: central, paracentral, foraminal, extraforaminal, unknown\n"
+    "- Return ONLY JSON matching the schema.\n"
 )
 
-_MORPH_INSTRUCTIONS = """You are a spine radiologist and biomechanical expert producing disc morphing values for a UE5 skeletal joint visualization.
 
-CRITICAL CONTEXT — UE5 processing:
-- Your output values are ADDED to 1.0 in Unreal Engine (bone scale base = 1.0).
-- So a value of 0.0 means no change, 0.2 means the joint scales to 1.2, -0.1 means 0.9.
-- This means even small values produce visible deformation. DO NOT output large values.
+_JSON_RE = re.compile(r"(?s)\{.*\}\s*$")
 
-You will receive:
-- "findings": structured pathology from a radiology report
-- "heuristic_baseline": a rule-based estimate (directional reference only, known to over-scale)
-
-Your job: use web search to look up real measured disc displacement data from trusted sources (PubMed, Spine journal, AJNR, Radiology, RSNA) to calibrate magnitudes.
-
-Joint layout per disc — 5 float values:
-  index 0: joint1 = top-right corner
-  index 1: joint2 = bottom-right corner
-  index 2: joint3 = bottom-left corner
-  index 3: joint4 = top-left corner
-  index 4: scaler = uniform whole-disc size change
-
-HARD LIMITS — every value MUST be between -0.5 and 0.5. No exceptions.
-
-Calibration:
-- mild → 0.03–0.08
-- moderate → 0.08–0.18
-- severe → 0.18–0.35
-- catastrophic/extreme → 0.35–0.5 (rare)
-- Most findings should be 0.05–0.2. Values above 0.3 are unusual.
-- Positive = outward expansion/protrusion. Negative = collapse/height loss.
-- Laterality → which corners (left: indices 2,3 / right: indices 0,1 / bilateral: all four)
-- Region → distribution (central: scaler / foraminal: corners / paracentral: both weighted)
-- size_mm when present: normalize against typical disc AP diameter (~35mm). A 6mm protrusion ≈ 0.17.
-
-Search strategy: for each distinct pathology type, search for measured displacement ranges to calibrate. Prefer quantitative studies.
-
-Return ONLY valid JSON (no explanation, no markdown):
-{"morph_targets": {"DISC": [j1, j2, j3, j4, scaler], ...}}"""
-
-_JSON_ONLY_RE = re.compile(r"(?s)\{.*\}\s*$")
+MAX_CORNER = 0.5
+MAX_SCALER = 0.5
 
 
-def _clamp(x: float) -> float:
-    return max(-0.5, min(0.5, x))
+def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, x))
 
 
-def normalize_level(level: str) -> str:
-    s = (level or "").strip().upper().replace("–", "-").replace("—", "-").replace(" ", "")
-    replacements = {
+def _disc_name(level: str) -> str:
+    s = (level or "").strip().upper().replace("\u2013", "-").replace("\u2014", "-").replace(" ", "")
+    reps = {
         "T2-T3": "T2-3", "T3-T4": "T3-4", "T4-T5": "T4-5", "T5-T6": "T5-6",
         "T6-T7": "T6-7", "T7-T8": "T7-8", "T8-T9": "T8-9", "T9-T10": "T9-10",
         "T10-T11": "T10-11", "T11-T12": "T11-12",
     }
-    return replacements.get(s, s)
-
-
-def _disc_name(level: str) -> str:
-    lv = normalize_level(level)
+    lv = reps.get(s, s)
     return lv.split("-", 1)[0] if "-" in lv else lv
 
 
-def _sev_to_pos(sev: str) -> float:
-    return {"none": 0.0, "mild": 0.1, "moderate": 0.2, "severe": 0.35}.get(sev, 0.1)
+def _validate_morph(values: List[float]) -> List[float]:
+    if len(values) != 5:
+        return [0.0, 0.0, 0.0, 0.0, 0.0]
+    corners = [round(_clamp(v, -MAX_CORNER, MAX_CORNER), 4) for v in values[:4]]
+    scaler = round(_clamp(values[4], -MAX_SCALER, MAX_SCALER), 4)
+    return corners + [scaler]
 
 
-def _sev_to_height_loss(sev: str) -> float:
-    return {"none": 0.0, "mild": 0.08, "moderate": 0.15, "severe": 0.25}.get(sev, 0.1)
-
-
-def _vert_from_notes(notes: str) -> str:
-    s = (notes or "").lower()
-    top = any(w in s for w in ("superior", "upper", "cranial", "cephalad", "top"))
-    bot = any(w in s for w in ("inferior", "lower", "caudal", "caudad", "bottom"))
-    if top and not bot:
-        return "top"
-    if bot and not top:
-        return "bottom"
-    return "both"
-
-
-def _apply_side(joints: List[float], lat: str, v: float, which: str) -> None:
-    if lat == "left":
-        if which in ("top", "both"):
-            joints[3] = _clamp(joints[3] + v)
-        if which in ("bottom", "both"):
-            joints[2] = _clamp(joints[2] + v)
-    elif lat == "right":
-        if which in ("top", "both"):
-            joints[0] = _clamp(joints[0] + v)
-        if which in ("bottom", "both"):
-            joints[1] = _clamp(joints[1] + v)
-    elif lat == "bilateral":
-        if which in ("top", "both"):
-            joints[0] = _clamp(joints[0] + v)
-            joints[3] = _clamp(joints[3] + v)
-        if which in ("bottom", "both"):
-            joints[1] = _clamp(joints[1] + v)
-            joints[2] = _clamp(joints[2] + v)
-    else:
-        v2 = v * 0.7
-        if which in ("top", "both"):
-            joints[0] = _clamp(joints[0] + v2)
-            joints[3] = _clamp(joints[3] + v2)
-        if which in ("bottom", "both"):
-            joints[1] = _clamp(joints[1] + v2)
-            joints[2] = _clamp(joints[2] + v2)
-
-
-def compute_joint_moves(abns: List[Abnormality]) -> List[float]:
-    joints = [0.0, 0.0, 0.0, 0.0, 0.0]
-
-    for a in abns:
-        lat = a.laterality or "unknown"
-        region = a.region or "unknown"
-        which = _vert_from_notes(a.notes)
-
-        if a.type == "disc_height_loss":
-            mag = _sev_to_height_loss(a.severity)
-            joints[4] = _clamp(joints[4] + (-mag * 0.3))
-            _apply_side(joints, lat if lat != "midline" else "unknown", -mag, which)
-            continue
-
-        sev_w = _sev_to_pos(a.severity)
-        size_w = _clamp(float(a.size_mm) / 15.0) if isinstance(a.size_mm, (int, float)) else None
-
-        if a.type in ("annular_bulge", "disc_bulge"):
-            w = size_w if size_w is not None else max(sev_w, 0.08)
-            if region in ("foraminal", "extraforaminal"):
-                _apply_side(joints, lat, w, which)
-            elif region == "paracentral":
-                joints[4] = _clamp(joints[4] + w * 0.5)
-                _apply_side(joints, lat, w * 0.5 if lat in ("left", "right", "bilateral") else w * 0.3, which)
-            else:
-                joints[4] = _clamp(joints[4] + w * 0.6)
-            continue
-
-        if a.type == "stenosis":
-            joints[4] = _clamp(joints[4] + sev_w)
-            continue
-
-        if a.type == "foraminal_narrowing":
-            _apply_side(joints, lat, sev_w if sev_w > 0 else 0.08, which)
-            continue
-
-        if a.type in ("protrusion", "extrusion"):
-            w = size_w if size_w is not None else max(sev_w, 0.15)
-            if region in ("central", "unknown"):
-                joints[4] = _clamp(joints[4] + w * 0.7)
-            elif region == "paracentral":
-                joints[4] = _clamp(joints[4] + w * 0.5)
-                _apply_side(joints, lat, w * 0.7, which)
-            else:
-                _apply_side(joints, lat, w, which)
-            continue
-
-        if a.type == "facet_arthropathy":
-            _apply_side(joints, lat, max(sev_w, 0.08), which)
-            continue
-
-        if a.type == "cord_compression":
-            joints[4] = _clamp(joints[4] + max(sev_w, 0.3))
-            continue
-
-        if a.type == "nerve_root_impingement":
-            _apply_side(joints, lat, max(sev_w, 0.25), which)
-
-    return [round(_clamp(v), 4) for v in joints]
-
-
-def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -> ExtractedJson:
+def ask_combined(report: str, *, model: str, api_key: Optional[str] = None) -> _CombinedExtraction:
     key = api_key or os.getenv("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("missing_anthropic_api_key")
@@ -201,77 +141,37 @@ def ask_spine_model(report: str, *, model: str, api_key: Optional[str] = None) -
     client = Anthropic(api_key=key)
     resp = client.beta.messages.create(
         model=model,
-        max_tokens=2048,
+        max_tokens=4096,
         temperature=0,
         betas=["structured-outputs-2025-11-13"],
-        system=_SPINE_EXTRACT_INSTRUCTIONS,
+        system=_SYSTEM,
         messages=[{"role": "user", "content": report}],
-        output_format={"type": "json_schema", "schema": transform_schema(ExtractedJson)},
+        output_format={"type": "json_schema", "schema": transform_schema(_CombinedExtraction)},
     )
     raw = resp.content[0].text
     try:
-        return ExtractedJson.model_validate_json(raw)
+        return _CombinedExtraction.model_validate_json(raw)
     except ValidationError:
-        m = _JSON_ONLY_RE.search((raw or "").strip())
+        m = _JSON_RE.search((raw or "").strip())
         if m is None:
             raise RuntimeError("AI did not return valid JSON")
-        return ExtractedJson.model_validate(json.loads(m.group(0)))
+        return _CombinedExtraction.model_validate(json.loads(m.group(0)))
 
 
-def ask_morph_model(
-    extracted: ExtractedJson,
-    heuristic: Dict[str, List[float]],
-    *,
-    model: str,
-    api_key: Optional[str] = None,
-) -> tuple[Dict[str, List[float]], str]:
-    client = Anthropic(api_key=api_key or os.getenv("ANTHROPIC_API_KEY"))
+def to_api_payload(combined: _CombinedExtraction, warnings: Optional[List[str]] = None) -> MorphResponse:
+    targets: List[DiscMorph] = []
 
-    resp = client.messages.create(
-        model=model,
-        max_tokens=2048,
-        system=_MORPH_INSTRUCTIONS,
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
-        messages=[{
-            "role": "user",
-            "content": json.dumps({
-                "findings": extracted.model_dump(exclude_defaults=True),
-                "heuristic_baseline": heuristic,
-                "note": "Values are added to 1.0 in UE5 bone scale. Keep all values between -0.5 and 0.5. Most should be 0.05-0.2. The heuristic over-scales badly — use web search for real data.",
-            }, indent=2),
-        }],
-    )
+    for lvl in combined.levels:
+        clamped = _validate_morph(lvl.morph)
+        if max(abs(v) for v in clamped) <= 0.001:
+            continue
+        targets.append(DiscMorph(name=_disc_name(lvl.level), values=clamped))
 
-    text = next((b.text for b in resp.content if hasattr(b, "text")), "")
-    m = _JSON_ONLY_RE.search(text.strip())
-    if not m:
-        return heuristic, "heuristic"
-
-    try:
-        raw = json.loads(m.group(0)).get("morph_targets", {})
-        refined = {
-            k: [round(_clamp(float(v)), 4) for v in vals]
-            for k, vals in raw.items()
-            if isinstance(vals, list) and len(vals) == 5
-        }
-        return (refined, "ai") if refined else (heuristic, "heuristic")
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return heuristic, "heuristic"
-
-
-def to_api_payload(
-    extracted: ExtractedJson,
-    morph_targets: Dict[str, List[float]],
-    morph_source: str = "heuristic",
-    warnings: Optional[List[str]] = None,
-) -> MorphResponse:
-    meta = dict(extracted.meta) if isinstance(extracted.meta, dict) else {}
-    meta["kept_levels"] = list(morph_targets.keys())
-    meta["morph_source"] = morph_source
+    meta: Dict[str, Any] = {"kept_levels": [t.name for t in targets]}
 
     return MorphResponse(
-        morph_targets=[DiscMorph(name=k, values=v) for k, v in morph_targets.items()],
-        global_findings=extracted.global_findings,
+        morph_targets=targets,
+        global_findings=combined.global_findings,
         meta=meta,
         warnings=list(warnings or []),
     )
@@ -287,15 +187,6 @@ def process_report_to_payload(
     anthropic_api_key: Optional[str] = None,
 ) -> MorphResponse:
     deid: DeidResult = deidentify_report(raw_report, use_ai=deid_with_ai, model=deid_model, api_key=deid_api_key)
-    extracted_text = extract_report(deid.text)
-    extracted = ask_spine_model(extracted_text, model=extract_model, api_key=anthropic_api_key)
-
-    heuristic: Dict[str, List[float]] = {
-        _disc_name(lvl.level): compute_joint_moves(lvl.abnormalities)
-        for lvl in extracted.levels
-        if max(abs(v) for v in compute_joint_moves(lvl.abnormalities)) > 0.0
-    }
-
-    morph_targets, morph_source = ask_morph_model(extracted, heuristic, model=extract_model, api_key=anthropic_api_key)
-
-    return to_api_payload(extracted, morph_targets, morph_source=morph_source, warnings=deid.warnings)
+    text = extract_report(deid.text)
+    combined = ask_combined(text, model=extract_model, api_key=anthropic_api_key)
+    return to_api_payload(combined, warnings=deid.warnings)
