@@ -137,6 +137,7 @@ class ExtractedJson(BaseModel):
 class DiscMorph(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str
+    index: Optional[int] = None
     values: List[float]
 
 

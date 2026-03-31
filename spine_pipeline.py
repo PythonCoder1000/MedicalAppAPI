@@ -106,6 +106,13 @@ _SYSTEM = (
 
 _JSON_RE = re.compile(r"(?s)\{.*\}\s*$")
 
+_DISC_INDEX: Dict[str, int] = {
+    "C1": 0,  "C2": 1,  "C3": 2,  "C4": 3,  "C5": 4,  "C6": 5,  "C7": 6,
+    "T1": 7,  "T2": 8,  "T3": 9,  "T4": 10, "T5": 11, "T6": 12,
+    "T7": 13, "T8": 14, "T9": 15, "T10": 16, "T11": 17, "T12": 18,
+    "L1": 19, "L2": 20, "L3": 21, "L4": 22, "L5": 23,
+}
+
 MAX_CORNER = 0.5
 MAX_SCALER = 0.5
 
@@ -165,7 +172,8 @@ def to_api_payload(combined: _CombinedExtraction, warnings: Optional[List[str]] 
         clamped = _validate_morph(lvl.morph)
         if max(abs(v) for v in clamped) <= 0.001:
             continue
-        targets.append(DiscMorph(name=_disc_name(lvl.level), values=clamped))
+        disc = _disc_name(lvl.level)
+        targets.append(DiscMorph(name=disc, index=_DISC_INDEX.get(disc), values=clamped))
 
     meta: Dict[str, Any] = {"kept_levels": [t.name for t in targets]}
 
