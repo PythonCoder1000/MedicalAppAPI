@@ -10,10 +10,10 @@ from schemas import MorphRequest, MorphResponse
 from spine_pipeline import process_report_to_payload
 
 APP_TITLE = "Office Ally Medical AI API"
-APP_VERSION = "3.0.1"
+APP_VERSION = "4.1.0"
 
 DEID_MODEL = os.getenv("DEID_MODEL", "gpt-5-mini")
-MORPH_MODEL = os.getenv("MORPH_MODEL", "claude-sonnet-4-5")
+MORPH_MODEL = os.getenv("MORPH_MODEL", "claude-sonnet-4-6")
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 

@@ -134,6 +134,14 @@ class ExtractedJson(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
+Gender = Literal["male", "female", "unknown"]
+
+
+class Patient(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    gender: Gender = "unknown"
+
+
 class DiscMorph(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str
@@ -143,6 +151,7 @@ class DiscMorph(BaseModel):
 
 class MorphResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    patient: Patient = Field(default_factory=Patient)
     morph_targets: List[DiscMorph] = Field(default_factory=list)
     global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
     meta: Dict[str, Any] = Field(default_factory=dict)

@@ -9,7 +9,7 @@ from anthropic import Anthropic, transform_schema
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from extract import DeidResult, deidentify_report, extract_report
-from schemas import Abnormality, DiscMorph, GlobalFindings, MorphResponse
+from schemas import Abnormality, DiscMorph, GlobalFindings, MorphResponse, Patient
 
 
 class _LevelMorph(BaseModel):
@@ -21,31 +21,43 @@ class _LevelMorph(BaseModel):
 
 class _CombinedExtraction(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    patient: Patient = Field(default_factory=Patient)
     levels: List[_LevelMorph] = Field(default_factory=list)
     global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
 
 
 _SYSTEM = (
-    "You are a spine MRI radiologist. Extract abnormal findings from the report "
-    "and produce disc morph values for a UE5 skeletal mesh visualization.\n\n"
+    "You are a board-certified spine radiologist extracting findings from MRI/CT reports "
+    "and producing disc morph values for a UE5 skeletal mesh visualization.\n\n"
 
-    "FOR EACH ABNORMAL LEVEL output:\n"
+    "ACCURACY RULES (most important):\n"
+    "1. Extract ONLY findings explicitly stated in the report text. Do NOT infer or invent.\n"
+    "2. Skip levels described as normal, unremarkable, or 'no significant abnormality'.\n"
+    "3. Quote-test: every abnormality you output must correspond to a phrase in the report.\n"
+    "4. If severity is not stated, use 'unknown' — do not guess.\n"
+    "5. If laterality is not stated, use 'unknown' — do not assume bilateral.\n"
+    "6. If size is not given numerically, leave size_mm null.\n"
+    "7. When in doubt, output fewer findings with lower morph values.\n\n"
+
+    "OUTPUT per abnormal level:\n"
     "- level: format like L4-L5 or T12-L1\n"
     "- abnormalities: each with type, severity, size_mm, laterality, region, notes\n"
-    "- morph: exactly 5 floats [joint1_topright, joint2_bottomright, "
-    "joint3_bottomleft, joint4_topleft, scaler]. Range -1.0 to 1.0.\n\n"
+    "- morph: exactly 5 floats [joint1_topright, joint2_bottomright, joint3_bottomleft, "
+    "joint4_topleft, scaler]. Range -1.0 to 1.0.\n\n"
 
-    "UE5 BONE SCALE CONTEXT (critical for correct visual output):\n"
+    "GENDER: scan the report for gender indicators (Mr/Mrs, he/she, his/her, male/female, "
+    "M/F in patient header). Output patient.gender as 'male', 'female', or 'unknown'.\n\n"
+
+    "UE5 BONE SCALE CONTEXT:\n"
     "- Each morph value is ADDED to 1.0 to become the bone scale.\n"
     "- Corner joints (indices 0-3) scale ALL 3 AXES simultaneously.\n"
-    "  A corner value of 0.2 produces scale 1.2 per axis = 1.2^3 = 1.73x volume.\n"
-    "  A corner value of 0.3 produces 1.3^3 = 2.2x volume — very large visually.\n"
-    "  THEREFORE corner values must be conservative. Most should be 0.03-0.15.\n"
-    "- Scaler (index 4) scales the ENTIRE disc HEIGHT ONLY (single Y axis).\n"
-    "  Positive scaler = taller/thicker disc. Negative = shorter/thinner disc.\n"
-    "  Scaler can tolerate larger values since it is single-axis.\n\n"
+    "  A value of 0.2 → scale 1.2 per axis → 1.2^3 ≈ 1.73x volume.\n"
+    "  A value of 0.3 → scale 1.3 per axis → 1.3^3 ≈ 2.2x volume — already very large.\n"
+    "  KEEP corner values small. Most should be 0.03-0.15.\n"
+    "- Scaler (index 4) scales the disc HEIGHT ONLY (single Y axis).\n"
+    "  Positive = taller/thicker disc. Negative = shorter/thinner disc.\n\n"
 
-    "PATHOLOGY-TO-MORPH MAPPING TABLE (corner values are small due to cubic scaling):\n\n"
+    "PATHOLOGY-TO-MORPH MAPPING TABLE:\n\n"
 
     "disc_bulge / annular_bulge:\n"
     "  central → scaler only: mild 0.04, moderate 0.08, severe 0.12\n"
@@ -75,32 +87,37 @@ _SYSTEM = (
     "  corner value ≈ (size_mm / 35.0) × 0.5\n"
     "  Example: 6mm protrusion → (6/35) × 0.5 ≈ 0.086\n\n"
 
-    "LATERALITY → which corners are affected:\n"
+    "LATERALITY → corner indices:\n"
     "  left → indices 2 (bottom-left) and 3 (top-left)\n"
     "  right → indices 0 (top-right) and 1 (bottom-right)\n"
     "  bilateral → all four corners at full magnitude\n"
-    "  midline/unknown → all four corners at 60% magnitude\n\n"
+    "  midline/unknown → all four at 60% magnitude\n\n"
 
-    "DISC NAMING: use the TOP vertebra. L4-L5 → disc named L4. T12-L1 → disc named T12.\n\n"
+    "DISC NAMING: TOP vertebra. L4-L5 → L4. T12-L1 → T12.\n\n"
 
-    "RULES:\n"
-    "- Extract ONLY explicitly described abnormal levels.\n"
-    "- Do NOT output levels described as normal.\n"
-    "- Do NOT invent or hallucinate findings.\n"
-    "- When the report is ambiguous or vague, prefer lower morph values.\n"
-    "- Corner values should rarely exceed ±0.25. Scaler rarely exceeds ±0.35.\n"
-    "- Use disc_height_loss when report says disc height loss, disc space narrowing, "
-    "or disc collapse.\n"
-    "- Set global_findings.cord_compression and nerve_root_impingement booleans.\n"
+    "TYPE NORMALIZATION:\n"
+    "- 'disc space narrowing', 'loss of disc height', 'disc collapse' → disc_height_loss\n"
+    "- 'broad-based bulge', 'diffuse bulge', 'circumferential bulge' → disc_bulge\n"
+    "- 'focal protrusion', 'broad-based protrusion' → protrusion\n"
+    "- 'herniation', 'disc extrusion', 'sequestration' → extrusion\n"
+    "- 'central canal narrowing', 'spinal stenosis' → stenosis\n"
+    "- 'neural foraminal narrowing', 'foraminal stenosis' → foraminal_narrowing\n\n"
+
+    "GLOBAL FINDINGS:\n"
+    "- Set cord_compression true ONLY if report explicitly states cord compression or "
+    "cord flattening with signal change.\n"
+    "- Set nerve_root_impingement true if any level has nerve root impingement.\n"
     "- Put incidental non-spine findings in global_findings.incidental.\n"
-    "- Put alignment notes in global_findings.alignment_notes.\n"
-    "- Valid types: annular_bulge, disc_bulge, protrusion, extrusion, stenosis, "
+    "- Put alignment notes in global_findings.alignment_notes.\n\n"
+
+    "Valid types: annular_bulge, disc_bulge, protrusion, extrusion, stenosis, "
     "foraminal_narrowing, facet_arthropathy, alignment, fracture, edema, "
     "cord_compression, nerve_root_impingement, disc_height_loss, other\n"
-    "- Valid severities: none, mild, moderate, severe, unknown\n"
-    "- Valid lateralities: left, right, bilateral, midline, unknown\n"
-    "- Valid regions: central, paracentral, foraminal, extraforaminal, unknown\n"
-    "- Return ONLY JSON matching the schema.\n"
+    "Valid severities: none, mild, moderate, severe, unknown\n"
+    "Valid lateralities: left, right, bilateral, midline, unknown\n"
+    "Valid regions: central, paracentral, foraminal, extraforaminal, unknown\n\n"
+
+    "Return ONLY JSON matching the schema.\n"
 )
 
 
@@ -178,6 +195,7 @@ def to_api_payload(combined: _CombinedExtraction, warnings: Optional[List[str]] 
     meta: Dict[str, Any] = {"kept_levels": [t.name for t in targets]}
 
     return MorphResponse(
+        patient=combined.patient,
         morph_targets=targets,
         global_findings=combined.global_findings,
         meta=meta,
@@ -191,7 +209,7 @@ def process_report_to_payload(
     deid_with_ai: bool = True,
     deid_model: str = "gpt-5-mini",
     deid_api_key: Optional[str] = None,
-    extract_model: str = "claude-sonnet-4-5",
+    extract_model: str = "claude-sonnet-4-6",
     anthropic_api_key: Optional[str] = None,
 ) -> MorphResponse:
     deid: DeidResult = deidentify_report(raw_report, use_ai=deid_with_ai, model=deid_model, api_key=deid_api_key)

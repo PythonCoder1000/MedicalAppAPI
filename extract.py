@@ -69,6 +69,7 @@ _DEID_INSTRUCTIONS = (
     "- Do not alter clinical findings.\n"
     "- Do not remove entire paragraphs.\n"
     "- Do not invent.\n"
+    "- Preserve gender (male/female) and age. These are clinical context, not PHI to remove.\n"
 )
 
 _JSON_ONLY_RE = re.compile(r"(?s)\{.*\}\s*$")
