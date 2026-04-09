@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from schemas import MorphRequest, MorphResponse
@@ -24,6 +24,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    body = await request.body()
+    print(f"\n=== {request.method} {request.url.path} ===")
+    print(f"Headers: {dict(request.headers)}")
+    print(f"Body ({len(body)} bytes): {body[:2000]!r}")
+    print("=" * 40)
+    response = await call_next(request)
+    return response
 
 
 @app.get("/health")
