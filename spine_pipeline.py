@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from anthropic import Anthropic, transform_schema
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from extract import DeidResult, deidentify_report, extract_report
+from extract import extract_report
 from schemas import Abnormality, DiscMorph, GlobalFindings, MorphResponse, Patient
 
 
@@ -206,13 +206,9 @@ def to_api_payload(combined: _CombinedExtraction, warnings: Optional[List[str]] 
 def process_report_to_payload(
     raw_report: str,
     *,
-    deid_with_ai: bool = True,
-    deid_model: str = "gpt-5-mini",
-    deid_api_key: Optional[str] = None,
     extract_model: str = "claude-sonnet-4-6",
     anthropic_api_key: Optional[str] = None,
 ) -> MorphResponse:
-    deid: DeidResult = deidentify_report(raw_report, use_ai=deid_with_ai, model=deid_model, api_key=deid_api_key)
-    text = extract_report(deid.text)
+    text = extract_report(raw_report)
     combined = ask_combined(text, model=extract_model, api_key=anthropic_api_key)
-    return to_api_payload(combined, warnings=deid.warnings)
+    return to_api_payload(combined, warnings=[])

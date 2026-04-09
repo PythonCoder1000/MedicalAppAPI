@@ -58,6 +58,10 @@ class DeidResult:
 _DEID_INSTRUCTIONS = (
     "You are a strict medical text de-identification system.\n"
     "Remove or replace any sensitive identifiers (PHI) from the input medical imaging report.\n"
+    "The input may have missing whitespace, missing line breaks, or run-together fields "
+    "(e.g. 'Xu, ShaohanPatient ID:10811063Gender: Male'). You must intelligently parse it "
+    "and RESTORE structure: insert newlines between fields, add spaces where words are joined, "
+    "and produce well-formatted output with one field per line in the header section.\n"
     "Return ONLY valid JSON with keys:\n"
     "deidentified_text: string\n"
     "removed: array of {type: string, value: string}\n"
@@ -70,6 +74,9 @@ _DEID_INSTRUCTIONS = (
     "- Do not remove entire paragraphs.\n"
     "- Do not invent.\n"
     "- Preserve gender (male/female) and age. These are clinical context, not PHI to remove.\n"
+    "- Preserve section headers like INDICATION, TECHNIQUE, FINDINGS, IMPRESSION on their own lines.\n"
+    "- Insert spaces between run-together words and newlines between distinct fields/sentences "
+    "where the original whitespace was stripped.\n"
 )
 
 _JSON_ONLY_RE = re.compile(r"(?s)\{.*\}\s*$")
@@ -180,13 +187,17 @@ _FIELD_LABELS = [
     "INDICATION", "TECHNIQUE", "FINDINGS", "IMPRESSION", "COMPARISON",
 ]
 _LABEL_BREAK_RE = re.compile(
-    r"(?<!\n)\s+(" + "|".join(re.escape(l) for l in _FIELD_LABELS) + r")\s*[:#]",
+    r"(" + "|".join(re.escape(l) for l in _FIELD_LABELS) + r")\s*[:#]",
     re.IGNORECASE,
 )
 
 
 def _insert_field_breaks(text: str) -> str:
-    return _LABEL_BREAK_RE.sub(lambda m: "\n" + m.group(1) + ":", text)
+    def _sub(m: re.Match) -> str:
+        start = m.start()
+        prefix = "" if start == 0 or text[start - 1] == "\n" else "\n"
+        return prefix + m.group(1) + ":"
+    return _LABEL_BREAK_RE.sub(_sub, text)
 
 
 def _apply_rules(text: str) -> Tuple[str, List[Dict[str, Any]]]:
@@ -249,12 +260,9 @@ def deidentify_report(text: str, *, use_ai: bool = True, model: str = "gpt-5-min
     warnings: List[str] = []
     removed_all: List[Dict[str, Any]] = []
 
-    rule_text, rule_removed = _apply_rules(text)
-    removed_all.extend(rule_removed)
-
     if not use_ai or OpenAI is None:
-        final_text, post_removed = _apply_rules(rule_text)
-        removed_all.extend(post_removed)
+        final_text, rule_removed = _apply_rules(text)
+        removed_all.extend(rule_removed)
         if use_ai and OpenAI is None:
             warnings.append("openai package not available; returned rule-based result only")
         return DeidResult(text=final_text, removed=removed_all, warnings=warnings)
@@ -263,8 +271,8 @@ def deidentify_report(text: str, *, use_ai: bool = True, model: str = "gpt-5-min
         client = OpenAI(api_key=api_key) if api_key else OpenAI()
     except Exception:
         warnings.append("failed to initialize OpenAI client; returned rule-based result only")
-        final_text, post_removed = _apply_rules(rule_text)
-        removed_all.extend(post_removed)
+        final_text, rule_removed = _apply_rules(text)
+        removed_all.extend(rule_removed)
         return DeidResult(text=final_text, removed=removed_all, warnings=warnings)
 
     llm_text: Optional[str] = None
@@ -274,7 +282,7 @@ def deidentify_report(text: str, *, use_ai: bool = True, model: str = "gpt-5-min
         resp = client.responses.create(
             model=model,
             instructions=_DEID_INSTRUCTIONS,
-            input="INPUT_REPORT:\n" + rule_text,
+            input="INPUT_REPORT:\n" + text,
             store=False,
         )
         raw = getattr(resp, "output_text", "") or ""
@@ -290,7 +298,7 @@ def deidentify_report(text: str, *, use_ai: bool = True, model: str = "gpt-5-min
     except Exception:
         warnings.append("AI de-id request failed; used rule-based de-id")
 
-    base = llm_text if isinstance(llm_text, str) and llm_text.strip() else rule_text
+    base = llm_text if isinstance(llm_text, str) and llm_text.strip() else text
     removed_all.extend(llm_removed)
 
     final_text, post_removed = _apply_rules(base)

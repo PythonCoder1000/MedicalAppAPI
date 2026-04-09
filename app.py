@@ -12,7 +12,6 @@ from spine_pipeline import process_report_to_payload
 APP_TITLE = "Office Ally Medical AI API"
 APP_VERSION = "4.1.1"
 
-DEID_MODEL = os.getenv("DEID_MODEL", "gpt-5-mini")
 MORPH_MODEL = os.getenv("MORPH_MODEL", "claude-sonnet-4-6")
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -48,8 +47,6 @@ async def morph(req: MorphRequest):
         return await asyncio.to_thread(
             process_report_to_payload,
             req.text,
-            deid_with_ai=req.use_ai_deid,
-            deid_model=DEID_MODEL,
             extract_model=MORPH_MODEL,
         )
     except Exception as e:
