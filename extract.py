@@ -168,7 +168,29 @@ def select_headings_as_text(original_text: str, heading_to_text: dict[HeadingNam
     return SelectOk(status="ok", selected_text="\n\n".join(parts).strip(), included_headings=included, total_strength=total_strength)
 
 
+_FIELD_LABELS = [
+    "Patient Name", "Patient ID", "MRN", "Medical Record Number",
+    "Accession Number", "Accession", "DOB", "Date of Birth",
+    "Gender", "Sex", "Age",
+    "Referring Physician", "Referring", "Ordering Physician", "Ordering",
+    "Attending Physician", "Attending",
+    "Exam Date", "Exam", "Modality", "Report Status", "Report Date",
+    "Location", "Facility", "Institution", "Hospital", "Clinic",
+    "Phone", "Telephone", "Email", "Address",
+    "INDICATION", "TECHNIQUE", "FINDINGS", "IMPRESSION", "COMPARISON",
+]
+_LABEL_BREAK_RE = re.compile(
+    r"(?<!\n)\s+(" + "|".join(re.escape(l) for l in _FIELD_LABELS) + r")\s*[:#]",
+    re.IGNORECASE,
+)
+
+
+def _insert_field_breaks(text: str) -> str:
+    return _LABEL_BREAK_RE.sub(lambda m: "\n" + m.group(1) + ":", text)
+
+
 def _apply_rules(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    text = _insert_field_breaks(text)
     removed: List[Dict[str, Any]] = []
     out_lines: List[str] = []
     for line in text.splitlines():
