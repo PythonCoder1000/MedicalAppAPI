@@ -299,11 +299,35 @@ def deidentify_report(text: str, *, use_ai: bool = True, model: str = "gpt-5-min
     return DeidResult(text=final_text, removed=removed_all, warnings=warnings)
 
 
+_GENDER_RE = re.compile(r"(?i)\b(?:gender|sex)\s*[:#]?\s*(male|female|m|f)\b")
+_PRONOUN_MALE_RE = re.compile(r"(?i)\b(?:mr\.?|he|his|him|male)\b")
+_PRONOUN_FEMALE_RE = re.compile(r"(?i)\b(?:mrs\.?|ms\.?|she|her|hers|female)\b")
+
+
+def _detect_gender(text: str) -> Optional[str]:
+    m = _GENDER_RE.search(text)
+    if m:
+        v = m.group(1).lower()
+        if v in ("male", "m"):
+            return "male"
+        if v in ("female", "f"):
+            return "female"
+    if _PRONOUN_FEMALE_RE.search(text):
+        return "female"
+    if _PRONOUN_MALE_RE.search(text):
+        return "male"
+    return None
+
+
 def extract_report(text: str) -> str:
     normalized = normalize_text(text)
+    gender = _detect_gender(text)
     extracted = extract_headings(normalized)
     if extracted.status == "fail":
         selected: SelectResult = SelectFail(status="fail", reason="no_sections", raw_text=normalized, total_strength=0)
     else:
         selected = select_headings_as_text(normalized, extracted.sections, min_total_strength=90)
-    return selected.selected_text if selected.status == "ok" else normalized
+    body = selected.selected_text if selected.status == "ok" else normalized
+    if gender:
+        body = f"PATIENT GENDER: {gender}\n\n{body}"
+    return body
