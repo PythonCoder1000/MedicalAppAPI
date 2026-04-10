@@ -1,204 +1,448 @@
 from __future__ import annotations
 
-import json
 import os
-import re
 from typing import Any, Dict, List, Optional
 
 from anthropic import Anthropic, transform_schema
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from extract import extract_report
-from schemas import Abnormality, DiscMorph, GlobalFindings, MorphResponse, Patient
+from schemas import Abnormality, DiscTarget, MorphResponse, Patient
+from utils import (
+    ANTHROPIC_API_KEY, DEID_MODEL, DISC_INDEX, EXTRACT_MODEL,
+    JOINT_NAMES, MAX_CORNER, MAX_SCALER,
+    detect_gender, disc_name, insert_field_breaks, validate_axis,
+)
+
+
+class _JointAxes(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    joint_1: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    joint_2: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    joint_3: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    joint_4: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    joint_center: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
 
 
 class _LevelMorph(BaseModel):
     model_config = ConfigDict(extra="forbid")
     level: str
     abnormalities: List[Abnormality] = Field(default_factory=list)
-    morph: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0, 0.0])
+    joints: _JointAxes = Field(default_factory=_JointAxes)
 
 
 class _CombinedExtraction(BaseModel):
     model_config = ConfigDict(extra="forbid")
     patient: Patient = Field(default_factory=Patient)
     levels: List[_LevelMorph] = Field(default_factory=list)
-    global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
 
 
-_SYSTEM = (
-    "You are a board-certified spine radiologist extracting findings from MRI/CT reports "
-    "and producing disc morph values for a UE5 skeletal mesh visualization.\n\n"
+_DEID_SYSTEM = """
+You are a medical report de-identification system.
 
-    "ACCURACY RULES (most important):\n"
-    "1. Extract ONLY findings explicitly stated in the report text. Do NOT infer or invent.\n"
-    "2. Skip levels described as normal, unremarkable, or 'no significant abnormality'.\n"
-    "3. Quote-test: every abnormality you output must correspond to a phrase in the report.\n"
-    "4. If severity is not stated, use 'unknown' — do not guess.\n"
-    "5. If laterality is not stated, use 'unknown' — do not assume bilateral.\n"
-    "6. If size is not given numerically, leave size_mm null.\n"
-    "7. When in doubt, output fewer findings with lower morph values.\n\n"
+Your job is to rewrite the input report as clean plain text with protected health information removed, while preserving all medical meaning.
 
-    "OUTPUT per abnormal level:\n"
-    "- level: format like L4-L5 or T12-L1\n"
-    "- abnormalities: each with type, severity, size_mm, laterality, region, notes\n"
-    "- morph: exactly 5 floats [joint1_topright, joint2_bottomright, joint3_bottomleft, "
-    "joint4_topleft, scaler]. Range -1.0 to 1.0.\n\n"
+Primary goal:
+1. Remove or replace all patient-identifying information.
+2. Preserve all clinically relevant content.
+3. Fix formatting problems caused by missing spaces, run-together fields, or broken line structure.
 
-    "GENDER: scan the report for gender indicators (Mr/Mrs, he/she, his/her, male/female, "
-    "M/F in patient header). Output patient.gender as 'male', 'female', or 'unknown'.\n\n"
+Input quality:
+- The input may contain missing whitespace.
+- Multiple fields may be merged together on one line.
+- Headers and values may run into each other.
+- You must intelligently separate fields and words before producing the final cleaned text.
 
-    "UE5 BONE SCALE CONTEXT:\n"
-    "- Each morph value is ADDED to 1.0 to become the bone scale.\n"
-    "- Corner joints (indices 0-3) scale ALL 3 AXES simultaneously.\n"
-    "  A value of 0.2 → scale 1.2 per axis → 1.2^3 ≈ 1.73x volume.\n"
-    "  A value of 0.3 → scale 1.3 per axis → 1.3^3 ≈ 2.2x volume — already very large.\n"
-    "  KEEP corner values small. Most should be 0.03-0.15.\n"
-    "- Scaler (index 4) scales the disc HEIGHT ONLY (single Y axis).\n"
-    "  Positive = taller/thicker disc. Negative = shorter/thinner disc.\n\n"
+Replace the following with placeholders:
+- Patient names -> [PATIENT_NAME]
+- Medical record number / MRN -> [MRN]
+- Accession number -> [ACCESSION]
+- Date of birth / DOB -> [DOB]
+- Any explicit date -> [DATE]
+- Address -> [ADDRESS]
+- Phone number -> [PHONE]
+- Email address -> [EMAIL]
+- Referring physician or provider name -> [PROVIDER]
+- Facility, hospital, clinic, imaging center, or site name -> [FACILITY]
 
-    "PATHOLOGY-TO-MORPH MAPPING TABLE:\n\n"
+Preserve exactly:
+- Sex or gender
+- Age
+- Modality
+- Exam type
+- Comparison statements
+- Section headers such as INDICATION, TECHNIQUE, FINDINGS, IMPRESSION, COMPARISON
+- All anatomy
+- All measurements
+- All pathology
+- All clinical findings
+- All medical meaning
 
-    "disc_bulge / annular_bulge:\n"
-    "  central → scaler only: mild 0.04, moderate 0.08, severe 0.12\n"
-    "  paracentral → affected corners 0.04-0.10 + scaler at half\n"
-    "  foraminal → affected corners only: mild 0.05, moderate 0.10, severe 0.15\n\n"
+Formatting rules:
+- Insert spaces between run-together words when needed.
+- Insert line breaks between distinct administrative fields and report sections when needed.
+- Keep the report readable and naturally structured.
+- Do not convert the report into JSON.
+- Do not summarize.
+- Do not explain what you changed.
+- Do not add any content that was not in the report.
 
-    "protrusion:\n"
-    "  central → scaler: mild 0.06, moderate 0.12, severe 0.18\n"
-    "  paracentral → affected corners 0.06-0.15 + scaler at 60%\n"
-    "  foraminal → affected corners: mild 0.08, moderate 0.15, severe 0.22\n\n"
+Important constraints:
+- Only remove or replace identifying information.
+- Do not remove clinical content just because it appears near identifying text.
+- If a field is ambiguous, preserve it unless it is clearly identifying.
+- Do not alter the medical meaning.
 
-    "extrusion:\n"
-    "  central → scaler: mild 0.10, moderate 0.18, severe 0.28\n"
-    "  paracentral → affected corners 0.10-0.22 + scaler at half\n"
-    "  foraminal → affected corners: mild 0.12, moderate 0.20, severe 0.30\n\n"
+Output rules:
+- Return only the cleaned report text.
+- No JSON.
+- No markdown.
+- No prefatory text.
+- No notes.
+"""
 
-    "disc_height_loss → SCALER ONLY (always negative): mild -0.08, moderate -0.18, severe -0.30\n"
-    "  NEVER apply disc height loss to corner joints. It is uniform disc thinning.\n\n"
+_EXTRACT_SYSTEM = """
+You are a board-certified spine radiologist and structured medical extraction system.
 
-    "stenosis → scaler only: mild 0.04, moderate 0.08, severe 0.14\n"
-    "foraminal_narrowing → affected corners: mild 0.04, moderate 0.08, severe 0.14\n"
-    "cord_compression → scaler: moderate 0.15, severe 0.25\n"
-    "nerve_root_impingement → affected corners: mild 0.06, moderate 0.12, severe 0.20\n"
-    "facet_arthropathy → affected corners: mild 0.03, moderate 0.06, severe 0.10\n\n"
+Your task is to read a spine MRI or CT report and return ONLY structured JSON that matches the provided schema exactly.
 
-    "SIZE CALIBRATION (when size_mm is available):\n"
-    "  corner value ≈ (size_mm / 35.0) × 0.5\n"
-    "  Example: 6mm protrusion → (6/35) × 0.5 ≈ 0.086\n\n"
+You must do two things:
+1. Extract only explicitly stated abnormal findings from the report.
+2. Convert those explicit findings into conservative UE5 disc morph offsets using the rules below.
 
-    "LATERALITY → corner indices:\n"
-    "  left → indices 2 (bottom-left) and 3 (top-left)\n"
-    "  right → indices 0 (top-right) and 1 (bottom-right)\n"
-    "  bilateral → all four corners at full magnitude\n"
-    "  midline/unknown → all four at 60% magnitude\n\n"
+Core rule:
+Everything in the output must be supported by the report text.
+If it is not explicitly stated, do not output it.
 
-    "DISC NAMING: TOP vertebra. L4-L5 → L4. T12-L1 → T12.\n\n"
+Absolute extraction rules:
+1. Extract only findings explicitly written in the report.
+2. Never infer, speculate, or invent pathology.
+3. Skip levels described as normal, unremarkable, or without significant abnormality.
+4. If severity is not stated, use "unknown".
+5. If laterality is not stated, use "unknown".
+6. If region is not stated, use "unknown".
+7. If no numeric size is given, use null for size_mm.
+8. When uncertain, output fewer findings and smaller morph values.
+9. Every abnormality in the JSON must be traceable to wording in the report.
 
-    "TYPE NORMALIZATION:\n"
-    "- 'disc space narrowing', 'loss of disc height', 'disc collapse' → disc_height_loss\n"
-    "- 'broad-based bulge', 'diffuse bulge', 'circumferential bulge' → disc_bulge\n"
-    "- 'focal protrusion', 'broad-based protrusion' → protrusion\n"
-    "- 'herniation', 'disc extrusion', 'sequestration' → extrusion\n"
-    "- 'central canal narrowing', 'spinal stenosis' → stenosis\n"
-    "- 'neural foraminal narrowing', 'foraminal stenosis' → foraminal_narrowing\n\n"
+Level rules:
+- Normalize levels to format like C5-C6, T12-L1, L4-L5.
+- Use only levels explicitly mentioned.
+- Do not create levels.
+- If the report describes a global finding without a specific level, place it only in the appropriate global field if the schema supports that.
+- Skip normal levels.
 
-    "GLOBAL FINDINGS:\n"
-    "- Set cord_compression true ONLY if report explicitly states cord compression or "
-    "cord flattening with signal change.\n"
-    "- Set nerve_root_impingement true if any level has nerve root impingement.\n"
-    "- Put incidental non-spine findings in global_findings.incidental.\n"
-    "- Put alignment notes in global_findings.alignment_notes.\n\n"
+Patient gender:
+Scan the report for gender indicators such as:
+- male, female
+- he, she, his, her
+- Mr, Mrs
+- M, F in header text
+Output patient.gender as one of:
+- "male"
+- "female"
+- "unknown"
 
-    "Valid types: annular_bulge, disc_bulge, protrusion, extrusion, stenosis, "
-    "foraminal_narrowing, facet_arthropathy, alignment, fracture, edema, "
-    "cord_compression, nerve_root_impingement, disc_height_loss, other\n"
-    "Valid severities: none, mild, moderate, severe, unknown\n"
-    "Valid lateralities: left, right, bilateral, midline, unknown\n"
-    "Valid regions: central, paracentral, foraminal, extraforaminal, unknown\n\n"
+Per-level output:
+For each abnormal level, output:
+- level
+- abnormalities
+- joints
 
-    "Return ONLY JSON matching the schema.\n"
-)
+Each abnormality must include:
+- type
+- severity
+- size_mm
+- laterality
+- region
+- notes
+
+Valid type values:
+- annular_bulge
+- disc_bulge
+- protrusion
+- extrusion
+- stenosis
+- foraminal_narrowing
+- facet_arthropathy
+- alignment
+- fracture
+- edema
+- cord_compression
+- nerve_root_impingement
+- disc_height_loss
+- other
+
+Valid severity values:
+- none
+- mild
+- moderate
+- severe
+- unknown
+
+Valid laterality values:
+- left
+- right
+- bilateral
+- midline
+- unknown
+
+Valid region values:
+- central
+- paracentral
+- foraminal
+- extraforaminal
+- unknown
+
+Type normalization rules:
+Map report wording to these normalized types:
+- "disc space narrowing", "loss of disc height", "disc collapse" -> disc_height_loss
+- "broad-based bulge", "diffuse bulge", "circumferential bulge" -> disc_bulge
+- "focal protrusion", "broad-based protrusion" -> protrusion
+- "herniation", "disc extrusion", "sequestration" -> extrusion
+- "central canal narrowing", "spinal stenosis" -> stenosis
+- "neural foraminal narrowing", "foraminal stenosis" -> foraminal_narrowing
+
+Joint output:
+Each level must contain a joints object with exactly these 5 keys:
+- joint_1
+- joint_2
+- joint_3
+- joint_4
+- joint_center
+
+Each key must contain an array of exactly 3 numbers:
+[x, y, z]
+
+Axis meanings:
+- x = left-right width change
+- y = height/thickness change
+- z = anterior-posterior depth or protrusion change
+
+These are OFFSET values only.
+Do not output final scale values.
+The server adds 1.0 afterward.
+Examples:
+- 0.10 means final scale 1.10
+- -0.08 means final scale 0.92
+
+Numeric constraints:
+- Every joint axis value must be between -0.5 and 0.5
+- Use conservative values
+- Most corner-joint values should usually remain in the range 0.03 to 0.15 unless the report clearly supports something larger
+
+Anatomic joint meaning:
+- joint_1 = top-right corner of the disc
+- joint_2 = bottom-right corner of the disc
+- joint_3 = bottom-left corner of the disc
+- joint_4 = top-left corner of the disc
+- joint_center = center disc bone for uniform scaling
+
+Laterality to corners:
+- left -> joint_3 and joint_4
+- right -> joint_1 and joint_2
+- bilateral -> all four corners
+- midline or unknown -> all four corners at 60 percent of the usual corner magnitude unless the mapping below says to use joint_center
+
+How to use joint_center:
+- Use joint_center for uniform disc changes
+- Especially use it for disc height loss
+- Keep corner values small unless the report clearly describes focal or lateralized pathology
+
+Disc naming note:
+For any downstream disc naming convention based on top vertebra:
+- L4-L5 corresponds to L4
+- T12-L1 corresponds to T12
+Do not change the reported level text in the JSON unless the schema explicitly asks for both forms.
+
+Pathology-to-morph mapping:
+Use the following table conservatively.
+
+disc_bulge or annular_bulge
+- central -> joint_center z
+  - mild 0.04
+  - moderate 0.08
+  - severe 0.12
+- paracentral right -> joint_1 and joint_2 z
+  - mild 0.04 to 0.08
+  - add joint_center z at half of the corner value
+- paracentral left -> joint_3 and joint_4 z
+  - mild 0.04 to 0.08
+  - add joint_center z at half of the corner value
+- foraminal right -> joint_1 and joint_2 z
+  - mild 0.05
+  - moderate 0.10
+  - severe 0.15
+- foraminal left -> joint_3 and joint_4 z
+  - mild 0.05
+  - moderate 0.10
+  - severe 0.15
+
+protrusion
+- central -> joint_center z
+  - mild 0.06
+  - moderate 0.12
+  - severe 0.18
+- paracentral right -> joint_1 and joint_2 z
+  - mild to severe 0.06 to 0.15
+  - add joint_center z at 60 percent of corner value
+- paracentral left -> joint_3 and joint_4 z
+  - mild to severe 0.06 to 0.15
+  - add joint_center z at 60 percent of corner value
+- foraminal on affected side -> affected corners z
+  - mild 0.08
+  - moderate 0.15
+  - severe 0.22
+
+extrusion
+- central -> joint_center z
+  - mild 0.10
+  - moderate 0.18
+  - severe 0.28
+- paracentral right -> joint_1 and joint_2 z
+  - 0.10 to 0.22
+  - add joint_center z at half of corner value
+- paracentral left -> joint_3 and joint_4 z
+  - 0.10 to 0.22
+  - add joint_center z at half of corner value
+- foraminal on affected side -> affected corners z
+  - mild 0.12
+  - moderate 0.20
+  - severe 0.30
+- For clearly large extrusions, you may also add a small positive y value of 0.02 to 0.05 on affected corners only if the report wording strongly supports vertical displacement
+
+disc_height_loss
+- Use joint_center only
+- Use y only
+- Always negative
+- mild -0.08
+- moderate -0.18
+- severe -0.30
+- Never apply disc height loss to corner joints
+
+stenosis
+- Use joint_center z
+- mild 0.04
+- moderate 0.08
+- severe 0.14
+
+foraminal_narrowing
+- Use affected side corner x values as inward squeeze
+- mild -0.04
+- moderate -0.08
+- severe -0.14
+
+cord_compression
+- Use joint_center z
+- moderate 0.15
+- severe 0.25
+
+nerve_root_impingement
+- Use affected side corner z
+- mild 0.06
+- moderate 0.12
+- severe 0.20
+
+facet_arthropathy
+- Use affected side corner x as widening
+- mild 0.03
+- moderate 0.06
+- severe 0.10
+
+Size calibration:
+If size_mm is explicitly provided, you may calibrate the primary morph axis using:
+(size_mm / 35.0) * 0.5
+
+Example:
+- 6 mm protrusion -> about 0.086 on the primary z axis
+
+Use size_mm as a calibration guide, but do not exceed the pathology table by a large amount unless the report clearly justifies it.
+
+Conflict resolution:
+If multiple instructions could apply:
+1. Prefer explicit report wording over all mapping defaults.
+2. Prefer conservative values over aggressive values.
+3. Prefer exact laterality and region when stated.
+4. If the report is vague, keep the abnormality but use "unknown" fields and modest morph values.
+5. If a level is described as normal, do not output it.
+
+Final output rules:
+- Return only valid JSON.
+- The JSON must match the provided schema exactly.
+- Do not include markdown.
+- Do not include explanation.
+- Do not include prose outside the JSON.
+"""
 
 
-_JSON_RE = re.compile(r"(?s)\{.*\}\s*$")
-
-_DISC_INDEX: Dict[str, int] = {
-    "C1": 0,  "C2": 1,  "C3": 2,  "C4": 3,  "C5": 4,  "C6": 5,  "C7": 6,
-    "T1": 7,  "T2": 8,  "T3": 9,  "T4": 10, "T5": 11, "T6": 12,
-    "T7": 13, "T8": 14, "T9": 15, "T10": 16, "T11": 17, "T12": 18,
-    "L1": 19, "L2": 20, "L3": 21, "L4": 22, "L5": 23,
-}
-
-MAX_CORNER = 0.5
-MAX_SCALER = 0.5
-
-
-def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, x))
-
-
-def _disc_name(level: str) -> str:
-    s = (level or "").strip().upper().replace("\u2013", "-").replace("\u2014", "-").replace(" ", "")
-    reps = {
-        "T2-T3": "T2-3", "T3-T4": "T3-4", "T4-T5": "T4-5", "T5-T6": "T5-6",
-        "T6-T7": "T6-7", "T7-T8": "T7-8", "T8-T9": "T8-9", "T9-T10": "T9-10",
-        "T10-T11": "T10-11", "T11-T12": "T11-12",
-    }
-    lv = reps.get(s, s)
-    return lv.split("-", 1)[0] if "-" in lv else lv
-
-
-def _validate_morph(values: List[float]) -> List[float]:
-    if len(values) != 5:
-        return [0.0, 0.0, 0.0, 0.0, 0.0]
-    corners = [round(_clamp(v, -MAX_CORNER, MAX_CORNER), 4) for v in values[:4]]
-    scaler = round(_clamp(values[4], -MAX_SCALER, MAX_SCALER), 4)
-    return corners + [scaler]
-
-
-def ask_combined(report: str, *, model: str, api_key: Optional[str] = None) -> _CombinedExtraction:
-    key = api_key or os.getenv("ANTHROPIC_API_KEY")
+def _get_client(api_key: Optional[str] = None) -> Anthropic:
+    key = api_key or ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("missing_anthropic_api_key")
+    return Anthropic(api_key=key)
 
-    client = Anthropic(api_key=key)
+
+def deid_report(text: str, *, model: str = DEID_MODEL, api_key: Optional[str] = None) -> str:
+    text = insert_field_breaks(text)
+    client = _get_client(api_key)
+    resp = client.messages.create(
+        model=model,
+        max_tokens=4096,
+        temperature=0,
+        system=_DEID_SYSTEM,
+        messages=[{"role": "user", "content": text}],
+    )
+    return resp.content[0].text
+
+
+def extract_morph(text: str, *, model: str = EXTRACT_MODEL, api_key: Optional[str] = None) -> _CombinedExtraction:
+    client = _get_client(api_key)
     resp = client.beta.messages.create(
         model=model,
         max_tokens=4096,
         temperature=0,
         betas=["structured-outputs-2025-11-13"],
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": report}],
+        system=_EXTRACT_SYSTEM,
+        messages=[{"role": "user", "content": text}],
         output_format={"type": "json_schema", "schema": transform_schema(_CombinedExtraction)},
     )
-    raw = resp.content[0].text
-    try:
-        return _CombinedExtraction.model_validate_json(raw)
-    except ValidationError:
-        m = _JSON_RE.search((raw or "").strip())
-        if m is None:
-            raise RuntimeError("AI did not return valid JSON")
-        return _CombinedExtraction.model_validate(json.loads(m.group(0)))
+    return _CombinedExtraction.model_validate_json(resp.content[0].text)
 
 
-def to_api_payload(combined: _CombinedExtraction, warnings: Optional[List[str]] = None) -> MorphResponse:
-    targets: List[DiscMorph] = []
+def to_api_payload(combined: _CombinedExtraction, gender_override: str = "unknown", warnings: Optional[List[str]] = None) -> MorphResponse:
+    targets: List[DiscTarget] = []
 
     for lvl in combined.levels:
-        clamped = _validate_morph(lvl.morph)
-        if max(abs(v) for v in clamped) <= 0.001:
-            continue
-        disc = _disc_name(lvl.level)
-        targets.append(DiscMorph(name=disc, index=_DISC_INDEX.get(disc), values=clamped))
+        name = disc_name(lvl.level)
+        j = lvl.joints
 
-    meta: Dict[str, Any] = {"kept_levels": [t.name for t in targets]}
+        c1 = validate_axis(j.joint_1, MAX_CORNER)
+        c2 = validate_axis(j.joint_2, MAX_CORNER)
+        c3 = validate_axis(j.joint_3, MAX_CORNER)
+        c4 = validate_axis(j.joint_4, MAX_CORNER)
+        cc = validate_axis(j.joint_center, MAX_SCALER)
+
+        all_vals = [c1, c2, c3, c4, cc]
+        if all(max(abs(a - 1.0) for a in axes) <= 0.001 for axes in all_vals):
+            continue
+
+        targets.append(DiscTarget(
+            disc=name,
+            index=DISC_INDEX.get(name),
+            joint_1=c1,
+            joint_2=c2,
+            joint_3=c3,
+            joint_4=c4,
+            joint_center=cc,
+        ))
+
+    patient = combined.patient
+    if patient.gender == "unknown" and gender_override != "unknown":
+        patient = Patient(gender=gender_override) # type: ignore
 
     return MorphResponse(
-        patient=combined.patient,
-        morph_targets=targets,
-        global_findings=combined.global_findings,
-        meta=meta,
+        patient=patient,
+        targets=targets,
+        meta={"kept_levels": [t.disc for t in targets]},
         warnings=list(warnings or []),
     )
 
@@ -206,9 +450,22 @@ def to_api_payload(combined: _CombinedExtraction, warnings: Optional[List[str]] 
 def process_report_to_payload(
     raw_report: str,
     *,
-    extract_model: str = "claude-sonnet-4-6",
-    anthropic_api_key: Optional[str] = None,
+    use_deid: bool = True,
+    deid_model: str = DEID_MODEL,
+    extract_model: str = EXTRACT_MODEL,
+    api_key: Optional[str] = None,
 ) -> MorphResponse:
-    text = extract_report(raw_report)
-    combined = ask_combined(text, model=extract_model, api_key=anthropic_api_key)
-    return to_api_payload(combined, warnings=[])
+    warnings: List[str] = []
+    gender = detect_gender(raw_report)
+
+    if use_deid:
+        try:
+            text = deid_report(raw_report, model=deid_model, api_key=api_key)
+        except Exception as e:
+            warnings.append(f"deid failed, using raw text: {e}")
+            text = insert_field_breaks(raw_report)
+    else:
+        text = insert_field_breaks(raw_report)
+
+    combined = extract_morph(text, model=extract_model, api_key=api_key)
+    return to_api_payload(combined, gender_override=gender, warnings=warnings)

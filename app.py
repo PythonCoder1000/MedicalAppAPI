@@ -1,18 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from schemas import MorphRequest, MorphResponse
 from spine_pipeline import process_report_to_payload
-
-APP_TITLE = "Office Ally Medical AI API"
-APP_VERSION = "4.1.1"
-
-MORPH_MODEL = os.getenv("MORPH_MODEL", "claude-sonnet-4-6")
+from utils import APP_TITLE, APP_VERSION, DEID_MODEL, EXTRACT_MODEL
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -47,7 +42,9 @@ async def morph(req: MorphRequest):
         return await asyncio.to_thread(
             process_report_to_payload,
             req.text,
-            extract_model=MORPH_MODEL,
+            use_deid=req.use_deid,
+            deid_model=DEID_MODEL,
+            extract_model=EXTRACT_MODEL,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from utils import TYPE_ALIASES, VALID_TYPES, SEVERITY_ALIASES
+
 Severity = Literal["none", "mild", "moderate", "severe", "unknown"]
 AbnormalityType = Literal[
     "annular_bulge",
@@ -27,7 +29,7 @@ Region = Literal["central", "paracentral", "foraminal", "extraforaminal", "unkno
 
 class MorphRequest(BaseModel):
     text: str
-    use_ai_deid: bool = True
+    use_deid: bool = True
 
 
 class Abnormality(BaseModel):
@@ -45,25 +47,8 @@ class Abnormality(BaseModel):
         if v is None:
             return "other"
         s = str(v).strip().lower().replace(" ", "_").replace("-", "_")
-        aliases = {
-            "disc_height": "disc_height_loss",
-            "disc_space_narrowing": "disc_height_loss",
-            "disc_space_narrowing.": "disc_height_loss",
-            "disc_space_loss": "disc_height_loss",
-            "disc_space_collapse": "disc_height_loss",
-            "disc_collapse": "disc_height_loss",
-            "loss_of_disc_height": "disc_height_loss",
-            "decreased_disc_height": "disc_height_loss",
-            "disc_height_reduction": "disc_height_loss",
-        }
-        s = aliases.get(s, s)
-        allowed = {
-            "annular_bulge", "disc_bulge", "protrusion", "extrusion",
-            "stenosis", "foraminal_narrowing", "facet_arthropathy", "alignment",
-            "fracture", "edema", "cord_compression", "nerve_root_impingement",
-            "disc_height_loss", "other",
-        }
-        return s if s in allowed else "other"
+        s = TYPE_ALIASES.get(s, s)
+        return s if s in VALID_TYPES else "other"
 
     @field_validator("severity", mode="before")
     @classmethod
@@ -73,12 +58,10 @@ class Abnormality(BaseModel):
         s = str(v).strip().lower()
         if s in {"none", "mild", "moderate", "severe", "unknown"}:
             return s
-        if "mild" in s or s in {"minimal", "slight"}:
-            return "mild"
-        if "moderate" in s:
-            return "moderate"
-        if "severe" in s:
-            return "severe"
+        s = SEVERITY_ALIASES.get(s, s)
+        for keyword in ("mild", "moderate", "severe"):
+            if keyword in s:
+                return keyword
         return "unknown"
 
     @field_validator("laterality", mode="before")
@@ -119,21 +102,6 @@ class ExtractedLevel(BaseModel):
     abnormalities: List[Abnormality] = Field(default_factory=list)
 
 
-class GlobalFindings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    cord_compression: bool = False
-    nerve_root_impingement: bool = False
-    alignment_notes: str = ""
-    incidental: List[str] = Field(default_factory=list)
-
-
-class ExtractedJson(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    levels: List[ExtractedLevel] = Field(default_factory=list)
-    global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-
 Gender = Literal["male", "female", "unknown"]
 
 
@@ -142,17 +110,18 @@ class Patient(BaseModel):
     gender: Gender = "unknown"
 
 
-class DiscMorph(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: str
+class DiscTarget(BaseModel):
+    disc: str
     index: Optional[int] = None
-    values: List[float]
+    joint_1: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    joint_2: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    joint_3: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    joint_4: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    joint_center: List[float] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
 
 
 class MorphResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
     patient: Patient = Field(default_factory=Patient)
-    morph_targets: List[DiscMorph] = Field(default_factory=list)
-    global_findings: GlobalFindings = Field(default_factory=GlobalFindings)
+    targets: List[DiscTarget] = Field(default_factory=list)
     meta: Dict[str, Any] = Field(default_factory=dict)
     warnings: List[str] = Field(default_factory=list)
