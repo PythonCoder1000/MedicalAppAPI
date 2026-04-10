@@ -235,18 +235,23 @@ Anatomic joint meaning:
 - joint_2 = bottom-right corner of the disc
 - joint_3 = bottom-left corner of the disc
 - joint_4 = top-left corner of the disc
-- joint_center = center disc bone for uniform scaling
+- joint_center = the PARENT bone of the entire disc
+
+CRITICAL — joint_center is a parent bone:
+- joint_center controls the ENTIRE disc including all four corners.
+- When joint_center is scaled, ALL child bones (joint_1 through joint_4) are scaled WITH it.
+- This means joint_center values COMPOUND with corner values.
+- Example: if joint_center z = 0.10 and joint_1 z = 0.10, the effective scale on joint_1 z is 1.10 * 1.10 = 1.21 (not 1.20).
+- Therefore: when you put a value on joint_center, REDUCE or ZERO OUT the same axis on corners to avoid double-scaling.
+- Use joint_center for uniform whole-disc changes (disc height loss, central bulges, stenosis).
+- Use corners ONLY for the focal/lateralized component that differs from the uniform change.
+- If a pathology is purely central or uniform, put it ONLY on joint_center and leave corners at zero.
 
 Laterality to corners:
 - left -> joint_3 and joint_4
 - right -> joint_1 and joint_2
 - bilateral -> all four corners
-- midline or unknown -> all four corners at 60 percent of the usual corner magnitude unless the mapping below says to use joint_center
-
-How to use joint_center:
-- Use joint_center for uniform disc changes
-- Especially use it for disc height loss
-- Keep corner values small unless the report clearly describes focal or lateralized pathology
+- midline or unknown -> use joint_center only, leave corners at zero
 
 Disc naming note:
 For any downstream disc naming convention based on top vertebra:
